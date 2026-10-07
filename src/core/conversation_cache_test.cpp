@@ -1,3 +1,7 @@
+// The disk-authoritative conversation cache (park-on-displacement): behaviour tests over real session files.
+// A parked conversation lives only on disk (format v1); the cache holds a RAM manifest of key hashes.  Park =
+// write to disk and free the RAM; restore = read back, re-verify token-exactly, triage the failures; active
+// turns touch nothing.
 #include "strata/core/conversation_cache.hpp"
 
 #include <cstdio>
@@ -64,156 +68,39 @@ int main() {
         check(segments <= 4,"thousands of small turns do not create thousands of restore transfers");
     }
     {
-        ConversationKv layer;
-        layer.k.resize(400);
-        std::vector<ConversationKv> layers;
-        layers.push_back(std::move(layer));
-        const size_t retained = layers.capacity()*sizeof(ConversationKv) + layers[0].bytes();
-        const size_t parked = image({1,2,3}).bytes();
-        ConversationCache cache(retained + parked, 4);
-        check(cache.put(image({1,2,3})), "park before retaining active storage");
-        cache.retain(std::move(layers), 16);
-        check(cache.bytes() == retained + parked && cache.size() == 1, "active retained storage consumes bytes but no parked slot");
-        cache.limit_reuse(9); cache.limit_reuse(12);
-        auto reuse = cache.take_reuse();
-        check(reuse.unchanged_tokens == 9, "a later continuation cannot undo a rewind's dirty boundary");
-        check(cache.bytes() == parked, "taking retained buffers releases their budget accounting");
-        cache.retain(std::move(reuse.kv), 16);
-        check(!cache.can_fit(parked),"retained storage is counted when checking a capture without eviction");
-        check(cache.retained_bytes() == retained && cache.size() == 1 && cache.evictions() == 0,
-              "optional reuse admission does not evict or release anything");
-        check(!cache.can_fit(SIZE_MAX) && !cache.can_fit(1,SIZE_MAX),"non-mutating reservation rejects overflow");
-        check(cache.make_room(parked), "reservation can discard optional active buffers");
-        check(cache.retained_bytes() == 0 && cache.size() == 1 && cache.evictions() == 0,
-              "pressure drops retained storage before evicting parked conversations");
-    }
-    const std::vector<int64_t> a = {1, 2, 3, 4}, b = {9, 8, 7, 6};
-    {
-        ConversationCache cache(1024, 2);
-        check(cache.put(image({1, 2, 3})), "park A");
-        check(cache.put(image({9, 8, 7})), "park B");
-        auto match = cache.best(a, {}, true);
-        check(match.tokens == 3 && match.live, "A/B/A: recover A");
-        auto restored = cache.take(match.index);
-        check(restored.live.ids == std::vector<int32_t>({1, 2, 3}), "taking selected A preserves identity");
-        check(cache.size() == 1 && cache.best(b, {}, true).tokens == 3, "B remains parked");
-        check(cache.bytes() == image({9,8,7}).bytes(), "byte accounting after take");
-        check(cache.put(std::move(restored)), "park returned A as newest");
-        check(cache.put(image({5, 6})), "evict oldest by slot limit");
-        check(cache.best(b, {}, true).tokens == 0 && cache.best(a, {}, true).tokens == 3, "B evicted before A");
-        check(cache.evictions() == 1, "eviction counter");
-    }
-    {
-        auto s = image({1, 2, 3});
-        ConversationCheckpoint cp;
-        cp.ids = {1, 2};
-        s.checkpoints.push_back(cp);
-        ConversationCache cache(4096, 4);
-        cache.put(std::move(s));
-        auto match = cache.best(std::vector<int64_t>{1, 2, 9, 4}, {}, true);
-        check(match.tokens == 2 && !match.live, "edited suffix falls back to parked checkpoint");
-        check(cache.best(a, {}, true).tokens == 3, "live prefix beats shorter checkpoint");
-        check(cache.best(a, {}, false).tokens == 0, "steering mode is isolated");
-        check(cache.best(std::vector<int64_t>{1, 2}, {}, true).tokens == 0, "equal-length checkpoint cannot consume last token");
-        check(cache.best(std::vector<int64_t>{1}, {}, true).tokens == 0, "short prompt cannot match");
-        check(cache.best(std::vector<int64_t>{}, {}, true).tokens == 0, "empty prompt cannot match");
-        cache.put(image({1, 2, 3}));
-        check(cache.best(a, {}, true).index == 1, "ties prefer most recently parked");
-    }
-    {
-        auto s = image({1, 2, 3});
-        s.live.imgs = {{1, 123}};
-        ConversationCache cache(1024, 3);
-        cache.put(std::move(s));
-        check(cache.best(a, {{1,123}}, true).tokens == 3, "same image can resume");
-        check(cache.best(a, {{1,124}}, true).tokens == 0, "different image pixels invalidate same pad tokens");
-        check(cache.best(a, {}, true).tokens == 0, "missing image invalidates prefix");
-        check(cache.best(a, {{1,123},{2,45}}, true).tokens == 0, "additional image in cached prefix invalidates");
-        check(cache.best(a, {{1,123},{3,45}}, true).tokens == 3, "image after cached prefix does not invalidate");
-    }
-    {
-        const size_t one = image({1,2,3}).bytes();
-        ConversationCache cache(one*2, 8);
-        cache.put(image({1,2,3})); cache.put(image({9,8,7}));
-        check(cache.bytes() == one*2, "budget holds two exact-sized images");
-        auto held = cache.take(cache.best(a, {}, true).index);
-        check(cache.make_room(one, held.bytes()), "count in-flight image when reserving outgoing snapshot");
-        check(cache.size() == 0, "in-flight reservation evicts otherwise fitting B");
-        check(cache.put(image({5,6,7}), held.bytes()), "insert with in-flight accounting");
-        check(cache.bytes()+held.bytes() <= one*2, "exchange obeys byte budget");
-        check(!cache.make_room(one+1, one), "oversized exchange rejected");
-        check(cache.size() == 1, "oversized snapshot does not evict useful entries");
-        auto huge = image({1}); huge.live.gdn.resize(one*3);
-        check(!cache.put(std::move(huge)), "oversized image rejected");
-        check(cache.size() == 1, "oversized put leaves cache unchanged");
-        check(!cache.make_room(0, one*2+1), "held larger than budget cannot underflow");
-    }
-    {
-        // #342: MAIN -> SUB (9 turns) -> MAIN with 4 slots.  Every SUB turn parks the previous turn's live state
-        // (its reply as generated, which the next request re-rendered) with a chain that holds that turn's
-        // boundary checkpoint; the copy a turn back adds only that stale tail and is dropped, so MAIN survives.
-        auto cp = [](std::vector<int32_t> ids) { ConversationCheckpoint c; c.ids = std::move(ids); return c; };
-        auto with = [](std::vector<int32_t> prefix, std::initializer_list<int32_t> more) {
-            prefix.insert(prefix.end(), more); return prefix;
+        // the transient K/V retention between a restore and the next park, with the later stages of a layer split
+        auto kv = [](size_t n) {
+            std::vector<ConversationKv> v(2);
+            for (auto& l : v) l.k.resize(n, 1);
+            return v;
         };
-        const std::vector<int32_t> root = {1, 2, 3, 4};
-        SavedConversation main = image({});
-        main.live.ids = with(with(root, {10, 11, 12}), {13, 14});
-        main.checkpoints = {cp(root), cp(with(root, {10, 11, 12}))};
-        const size_t big = 1 << 20;
-        ConversationCache cache(big, 4);
-        check(cache.put(std::move(main)), "park MAIN");
-        std::vector<int32_t> history = with(root, {20});         // SUB's conversation so far, re-rendered
-        std::vector<ConversationCheckpoint> chain = {cp(root)};
-        for (int turn = 1; turn <= 9; ++turn) {
-            chain.push_back(cp(history));                        // the turn boundary the next request resumes from
-            SavedConversation sub = image({});
-            sub.live.ids = with(history, {900, (int32_t) turn});   // + the reply with its thinking (stale tail)
-            sub.checkpoints = chain;
-            check(cache.put(std::move(sub)), "park SUB turn");
-            check(cache.size() <= 2, "one parked copy of SUB at a time");
-            history = with(history, {30, (int32_t) turn});       // the reply as the next request renders it
-        }
-        check(cache.evictions() == 0 && cache.superseded() == 8, "8 superseded copies dropped, nothing evicted");
-        const auto m = cache.best(with(with(root, {10, 11, 12}), {13, 14, 15}), {}, true);
-        check(m.tokens == 9 && m.live, "MAIN still restores in full");
-        const auto s = cache.best(with(history, {40}), {}, true);
-        check(s.tokens == (int64_t) history.size() - 2, "SUB resumes from its last turn boundary");
-    }
-    {
-        // what is NOT superseded: another conversation sharing only the root, an entry without checkpoints, the
-        // other steering mode, a branch whose deepest checkpoint the new chain does not hold
-        auto cp = [](std::vector<int32_t> ids) { ConversationCheckpoint c; c.ids = std::move(ids); return c; };
-        ConversationCache cache(1 << 20, 8);
-        SavedConversation other = image({1, 2, 3, 4, 50, 51, 52});
-        other.checkpoints = {cp({1, 2, 3, 4}), cp({1, 2, 3, 4, 50, 51})};
-        cache.put(std::move(other));
-        cache.put(image({1, 2, 3, 4, 7, 7}));                    // no checkpoints
-        SavedConversation steered = image({1, 2, 3, 4, 60, 61}, false);
-        steered.checkpoints = {cp({1, 2, 3, 4, 60})};
-        cache.put(std::move(steered));
-        SavedConversation branch = image({1, 2, 3, 4, 60, 70, 71});
-        branch.checkpoints = {cp({1, 2, 3, 4}), cp({1, 2, 3, 4, 60, 70})};
-        cache.put(std::move(branch));
-        SavedConversation incoming = image({1, 2, 3, 4, 60, 80, 81});
-        incoming.checkpoints = {cp({1, 2, 3, 4}), cp({1, 2, 3, 4, 60})};
-        check(cache.put(std::move(incoming)), "park a conversation sharing roots with all of them");
-        check(cache.size() == 5 && cache.superseded() == 0, "none of them is superseded");
-        SavedConversation same_state = image({1, 2, 3, 4, 60, 70});   // live equal to the branch's deepest point
-        same_state.checkpoints = {cp({1, 2, 3, 4})};
-        check(cache.put(std::move(same_state)) && cache.superseded() == 1 && cache.size() == 5,
-              "the live state equal to an entry's deepest checkpoint supersedes it");
-        SavedConversation huge = image({1, 2, 3, 4, 60, 80});
-        huge.checkpoints = {cp({1, 2, 3, 4}), cp({1, 2, 3, 4, 60})};
-        huge.live.gdn.resize(2 << 20);
-        check(!cache.put(std::move(huge)) && cache.size() == 5 && cache.superseded() == 1,
-              "an oversized put drops nothing");
-    }
-    {
-        ConversationCache disabled(0,4), no_slots(1024,0);
-        check(!disabled.enabled() && !no_slots.enabled(), "both disable switches");
-        check(!disabled.put(image({1,2,3})) && !no_slots.put(image({1,2,3})), "disabled cache stores nothing");
-        check(disabled.best(a,{},true).tokens == 0, "disabled cache has no matches");
+        ConversationCache cache(true, 1 << 20);
+        std::vector<std::vector<ConversationKv>> stage_kv;
+        stage_kv.push_back(kv(1000));
+        stage_kv.push_back(kv(2000));
+        cache.retain(kv(500), 40, std::move(stage_kv));
+        check(cache.retained_bytes() >= 2 * (500 + 1000 + 2000), "retained bytes count every stage");
+        cache.limit_reuse(30);
+        auto r = cache.take_reuse();
+        check(r.kv.size() == 2 && r.stages.size() == 2 && r.unchanged_tokens == 30 &&
+              r.stages[0].unchanged_tokens == 30 && r.stages[1].unchanged_tokens == 30 &&
+              r.stages[1].captured_tokens == 40, "every stage's reuse is limited to the first rewrite");
+        check(cache.retained_bytes() == 0, "taken once");
+        std::vector<std::vector<ConversationKv>> big;
+        big.push_back(kv(1 << 20));
+        cache.retain(kv(500), 40, std::move(big));
+        check(cache.retained_bytes() == 0, "a stage's K/V over the budget drops the whole reuse");
+        std::vector<std::vector<ConversationKv>> one;
+        one.push_back(kv(100));
+        cache.retain(kv(500), 40, std::move(one));
+        cache.limit_reuse(0);
+        check(cache.retained_bytes() == 0, "a rewrite from the start drops every stage's reuse");
+        cache.retain(kv(500), 40);
+        r = cache.take_reuse();
+        check(r.kv.size() == 2 && r.stages.empty(), "no layer split: no stage reuse, as before");
+        ConversationCache no_budget(true, 0);
+        no_budget.retain(kv(500), 40);
+        check(no_budget.retained_bytes() == 0, "without a retention budget nothing is retained");
     }
     {
         // layer-split parking: checkpoints moved apart into stage parts and put back, no running state copied
@@ -274,223 +161,250 @@ int main() {
         auto none = conversation_checkpoints_split({}, 3);
         check(conversation_checkpoints_merge(std::move(none), back) && back.empty(), "no checkpoints: nothing to do");
     }
-    {
-        // the later stages' retained K/V, kept with the first stage's and limited together
-        auto kv = [](size_t n) {
-            std::vector<ConversationKv> v(2);
-            for (auto& l : v) l.k.resize(n, 1);
-            return v;
-        };
-        ConversationCache cache(1 << 20, 4);
-        std::vector<std::vector<ConversationKv>> stage_kv;
-        stage_kv.push_back(kv(1000));
-        stage_kv.push_back(kv(2000));
-        cache.retain(kv(500), 40, std::move(stage_kv));
-        check(cache.retained_bytes() >= 2 * (500 + 1000 + 2000), "retained bytes count every stage");
-        cache.limit_reuse(30);
-        auto r = cache.take_reuse();
-        check(r.kv.size() == 2 && r.stages.size() == 2 && r.unchanged_tokens == 30 &&
-              r.stages[0].unchanged_tokens == 30 && r.stages[1].unchanged_tokens == 30 &&
-              r.stages[1].captured_tokens == 40, "every stage's reuse is limited to the first rewrite");
-        check(cache.retained_bytes() == 0, "taken once");
-        std::vector<std::vector<ConversationKv>> big;
-        big.push_back(kv(1 << 20));
-        cache.retain(kv(500), 40, std::move(big));
-        check(cache.retained_bytes() == 0, "a stage's K/V over the budget drops the whole reuse");
-        std::vector<std::vector<ConversationKv>> one;
-        one.push_back(kv(100));
-        cache.retain(kv(500), 40, std::move(one));
-        cache.limit_reuse(0);
-        check(cache.retained_bytes() == 0, "a rewrite from the start drops every stage's reuse");
-        cache.retain(kv(500), 40);
-        r = cache.take_reuse();
-        check(r.kv.size() == 2 && r.stages.empty(), "no layer split: no stage reuse, as before");
-    }
-    {   // pin=N: a parked conversation that holds a pinned shared prefix is not the one evicted
-        const size_t one = image({1,2,3}).bytes();
-        auto pinned = image({1,2,3});
-        pinned.checkpoints.push_back(ConversationCheckpoint{});
-        pinned.checkpoints.back().ids = {1,2};
-        pinned.checkpoints.back().pinned = true;
-        pinned.checkpoints.back().gdn.resize(64, 1);
-        const size_t pinned_bytes = pinned.bytes();
-        ConversationCache big(pinned_bytes + one * 2 + 64, 3);
-        check(pinned.pinned() && !image({1,2,3}).pinned(), "a conversation is pinned when one of its checkpoints is");
-        check(big.put(std::move(pinned)), "the pinned conversation is parked first (the oldest)");
-        check(big.put(image({7,8,9})) && big.put(image({4,5,6})) && big.size() == 3, "two more fill the slots");
-        check(big.put(image({10,11,12})) && big.size() == 3 && big.evictions() == 1,
-              "a fourth evicts the oldest unpinned one");
-        check(big.best(std::vector<int32_t>{1,2,9,9}, {}, true).tokens == 2, "the pinned prefix is still found");
-        ConversationCache tiny(pinned_bytes + 8, 2);
-        auto p2 = image({1,2,3});
-        p2.checkpoints.push_back(ConversationCheckpoint{});
-        p2.checkpoints.back().ids = {1,2};
-        p2.checkpoints.back().pinned = true;
-        p2.checkpoints.back().gdn.resize(64, 1);
-        check(tiny.put(std::move(p2)), "a pinned one fits an empty cache");
-        check(!tiny.put(image({7,8,9})) && tiny.size() == 1, "nothing else fits beside it: parking is refused, the pin stays");
-    }
-    {   // spill-to-session-file: the eviction victim is serialized to disk (format v1) instead of dropped, the
-        // RAM manifest keeps (key hash, tokens, geometry, path), best() consults it, and a hit reads the file back
-        namespace fs = std::filesystem;
-        const fs::path dir = fs::temp_directory_path() / "strata_conv_cache_spill_test";
+
+    namespace fs = std::filesystem;
+    const fs::path dir = fs::temp_directory_path() / "strata_conv_cache_disk_test";
+    fs::remove_all(dir);
+    fs::create_directories(dir);
+    std::vector<fs::path> spill_files;   // what park() has written so far
+    bool fail_write = false;             // injected write failure
+    bool refuse_read = false;            // injected RAM-admission refusal on read
+    bool swap_image = false;             // injected: the read returns a state the manifest never recorded
+    const SessionFileIdentity file_id{11, 22};
+    ConversationCache::SpillHooks hooks;
+    hooks.dir = dir.string();
+    hooks.write = [&](const SavedConversation& im, const std::string& path, std::string& e) {
+        if (fail_write) { e = "injected write failure"; return false; }
+        size_t bytes = 0;
+        const bool ok = session_file_write(path, im, file_id, bytes, e, {}, nullptr);
+        if (ok) spill_files.push_back(path);
+        return ok;
+    };
+    hooks.read = [&](const std::string& path, SavedConversation& out, std::string& e, bool& admission_refused) {
+        admission_refused = false;
+        if (refuse_read) {
+            admission_refused = true;
+            e = "injected RAM admission refusal";
+            return false;
+        }
+        if (swap_image) {
+            SavedConversation other = image({9, 9, 9});
+            other.live.gdn.resize(64, 8);
+            out = std::move(other);
+            return true;
+        }
+        size_t bytes = 0;
+        return session_file_read(path, file_id, out, bytes, e, {}, nullptr);
+    };
+    hooks.remove = [](const std::string& path) { std::error_code ec; return fs::remove(path, ec); };
+    const auto on_disk = [&] {
+        size_t n = 0;
+        for (const auto& e : fs::directory_iterator(dir))
+            if (e.is_regular_file() && e.path().filename().string()[0] != '.') ++n;
+        return n;
+    };
+    const auto dot_files = [&] {
+        size_t n = 0;
+        for (const auto& e : fs::directory_iterator(dir))
+            if (e.is_regular_file() && e.path().filename().string()[0] == '.') ++n;
+        return n;
+    };
+    const auto fresh = [&]() {
         fs::remove_all(dir);
         fs::create_directories(dir);
-        double clock_now = 100.0;
-        ConversationCache::SpillHooks hooks;
-        hooks.dir = dir.string();
-        hooks.write = [](const SavedConversation& im, const std::string& path, std::string& e) {
-            const SessionFileIdentity id{11, 22};
-            size_t bytes = 0;
-            return session_file_write(path, im, id, bytes, e, {}, nullptr);
-        };
-        hooks.read = [](const std::string& path, SavedConversation& out, std::string& e) {
-            const SessionFileIdentity id{11, 22};
-            size_t bytes = 0;
-            return session_file_read(path, id, out, bytes, e, {}, nullptr);
-        };
-        hooks.remove = [](const std::string& path) { std::error_code ec; fs::remove(path, ec); return !ec; };
-        hooks.admit_write = [](size_t) { return true; };
-        const auto hooked = [&]() {
-            ConversationCache c(1 << 20, 2);
-            c.set_spill_hooks(hooks);
-            c.set_spill_clock([&] { return clock_now; });
-            c.set_spill_cooldown(120.0);
-            return c;
-        };
+        spill_files.clear();
+        ConversationCache c(true, 1 << 20);
+        c.set_spill_hooks(hooks);
+        return c;
+    };
 
-        {   // budget-driven eviction spills the oldest entry; a manifest hit reads it back whole
-            auto c = hooked();
-            SavedConversation big = image({1, 2, 3});
-            ConversationCheckpoint cp;
-            cp.ids = {1, 2};
-            cp.gdn.resize(64, 3);
-            big.checkpoints.push_back(cp);
-            big.kv.emplace_back();
-            big.kv.back().k.resize(512);
-            const size_t one = big.bytes();
-            const size_t two = image({9, 8, 7}).bytes();
-            ConversationCache small(one + two, 8);   // exactly big + one small entry
-            small.set_spill_hooks(hooks);
-            small.set_spill_clock([&] { return clock_now; });
-            small.set_spill_cooldown(0.0);   // the hysteresis has its own block
-            check(small.put(std::move(big)) && small.put(image({9, 8, 7})), "two entries fill the budget");
-            check(small.spilled_entries() == 0, "nothing spilled yet");
-            check(small.put(image({5, 6, 7})), "a third parks by spilling the oldest");
-            check(small.evictions() == 1 && small.spills() == 1 && small.failed_spills() == 0,
-                  "the budget eviction became a spill, not a drop");
-            check(small.spilled_entries() == 1 && small.spilled_bytes() >= one, "the manifest holds the spilled entry");
-            check(small.bytes() == two * 2 && small.size() == 2, "the victim's RAM is freed and accounted");
-            const std::vector<int64_t> prompt{1, 2, 3, 4};
-            auto m = small.best(prompt, {}, true);
-            check(m.spilled && m.tokens == 3 && !m.live, "best() finds the spilled entry through the manifest");
-            check(small.best(std::vector<int64_t>{9, 8, 7, 5}, {}, true).spilled == false &&
-                  small.best(std::vector<int64_t>{9, 8, 7, 5}, {}, true).tokens == 3,
-                  "the RAM entry still wins; the non-matching prompt misses the manifest");
-            check(small.best(prompt, {}, false).tokens == 0, "steering mode isolates the manifest too");
-            SavedConversation back;
-            check(small.restore_spilled(m.index, back) && back.live.ids == std::vector<int32_t>({1, 2, 3}) &&
-                  back.checkpoints.size() == 1 && back.checkpoints[0].ids == std::vector<int32_t>({1, 2}) &&
-                  back.checkpoints[0].gdn.size() == 64 && back.kv.size() == 1 && back.kv[0].k.size() == 512,
-                  "the spilled entry reads back whole, checkpoint chain and K/V included");
-            check(small.spilled_entries() == 0 && small.spilled_restores() == 1, "the manifest entry goes on restore");
-            check(small.best(prompt, {}, true).tokens == 0, "the restored entry is the caller's active state now");
+    {   // park-on-displacement: park writes one session file and keeps only the manifest; consecutive best()
+        // calls on an active conversation write nothing and read nothing (zero cache IO while active)
+        auto c = fresh();
+        SavedConversation big = image({1, 2, 3});
+        ConversationCheckpoint cp;
+        cp.ids = {1, 2};
+        cp.gdn.resize(64, 3);
+        big.checkpoints.push_back(cp);
+        big.kv.emplace_back();
+        big.kv.back().k.resize(512);
+        check(c.park(std::move(big)), "the displaced conversation parks to disk");
+        check(c.parks() == 1 && c.failed_parks() == 0 && c.spilled_entries() == 1, "one park, one manifest record");
+        check(c.spilled_bytes() >= 512 + 64, "the manifest accounts the file's payload");
+        check(on_disk() == 1 && c.bytes() == 0, "the state lives only on disk: no RAM entry, no reuse held");
+        const std::vector<int64_t> prompt{1, 2, 3, 4};
+        for (int turn = 0; turn < 5; ++turn) {
+            auto m = c.best(prompt, {}, true);
+            check(m.spilled && m.tokens == 3, "the manifest matches the active conversation");
         }
-        {   // hysteresis: the entry just hit and re-parked is never spilled inside the cooldown; later it is
-            ConversationCache c(1 << 20, 1);
-            c.set_spill_hooks(hooks);
-            c.set_spill_clock([&] { return clock_now; });
-            c.set_spill_cooldown(120.0);
-            check(c.put(image({1, 2, 3})), "A parked");
-            auto ra = c.take(c.best(a, {}, true).index);   // A is the active conversation
-            clock_now += 1.0;
-            check(c.put(std::move(ra)), "A parks again right after its turn");
-            check(!c.put(image({4, 5, 6})), "inside the cooldown the fresh hit is not spilled: the park is refused");
-            check(c.spills() == 0 && c.evictions() == 0 && c.failed_spills() == 0, "no thrash spill happened");
-            clock_now += 200.0;
-            check(c.put(image({4, 5, 6})), "past the cooldown the stale entry spills");
-            check(c.spills() == 1 && c.evictions() == 1, "the eviction after the cooldown wrote a file");
-        }
-        {   // fail-open: a failed write falls back to the current behaviour (drop), parking still succeeds
-            auto c = hooked();
-            c.set_spill_cooldown(0.0);
-            c.set_spill_hooks([&] {
-                ConversationCache::SpillHooks h2 = hooks;
-                h2.write = [](const SavedConversation&, const std::string&, std::string& e) {
-                    e = "injected failure";
-                    return false;
-                };
-                return h2;
-            }());
-            c.set_spill_clock([&] { return clock_now; });
-            const size_t one = image({1, 2, 3}).bytes();
-            check(c.put(image({1, 2, 3})) && c.put(image({7, 8, 9})), "two entries parked");
-            check(c.put(image({4, 5, 6})) && c.evictions() == 1 && c.failed_spills() == 1 && c.spills() == 0,
-                  "a failed spill still evicts (fail-open drop) and counts the failure");
-            check(!c.last_spill_error().empty(), "the spill error is reported");
-            check(c.spilled_entries() == 0, "a failed spill leaves no manifest entry");
-        }
-        {   // the RAM safety hook: a refused admission does not write to disk (the victim is dropped instead)
-            auto c = hooked();
-            c.set_spill_cooldown(0.0);
-            c.set_spill_hooks([&] {
-                ConversationCache::SpillHooks h2 = hooks;
-                h2.admit_write = [](size_t) { return false; };
-                return h2;
-            }());
-            c.set_spill_clock([&] { return clock_now; });
-            check(c.put(image({1, 2, 3})) && c.put(image({7, 8, 9})), "two entries parked");
-            check(c.put(image({4, 5, 6})) && c.evictions() == 1 && c.failed_spills() == 1 && c.spills() == 0,
-                  "a refused admission falls back to the drop");
-        }
-        {   // spill_one: the gate-refusal path frees exactly one eligible entry per call; pins and fresh entries stay
-            auto c = hooked();
-            check(c.put(image({1, 2, 3})), "A parked");
-            clock_now += 200.0;
-            check(c.put(image({7, 8, 9})), "B parked fresh");
-            check(c.spill_one(), "spill_one spills the oldest eligible entry");
-            check(c.spills() == 1 && c.evictions() == 0 && c.size() == 1 && c.spilled_entries() == 1,
-                  "spill_one frees RAM without counting an eviction");
-            check(!c.spill_one(), "the fresh entry is inside the cooldown: nothing more is spillable");
-            clock_now += 200.0;
-            check(c.spill_one(), "past the cooldown the last entry spills too");
-            check(c.size() == 0 && c.spilled_entries() == 2, "an emptied cache");
-        }
-        {   // a spilled file that no longer reads (corrupt, identity changed) is dropped, not a dead match
-            auto c = hooked();
-            check(c.put(image({1, 2, 3})) && c.put(image({7, 8, 9})), "two entries parked");
-            clock_now += 200.0;
-            check(c.put(image({4, 5, 6})) && c.spills() == 1, "the oldest spilled");
-            check(c.spilled_entries() == 1, "manifest holds one");
-            // corrupt every spill file the earlier blocks left behind (each cache numbers its own spill-1.bin, ...)
-            for (const auto& e : fs::directory_iterator(dir))
-                if (e.is_regular_file() && e.file_size() > 0) fs::resize_file(e.path(), 8);
-            SavedConversation back;
-            auto m = c.best(std::vector<int64_t>{1, 2, 3, 4}, {}, true);
-            check(m.spilled, "the manifest still matches the corrupt entry");
-            check(!c.restore_spilled(m.index, back), "the corrupt file refuses to read");
-            check(c.spilled_entries() == 0, "the unreadable entry is dropped from the manifest (fail-open)");
-        }
-        {   // superseded spilled copies leave the manifest when the same conversation parks a newer state
-            auto c = hooked();
-            SavedConversation big = image({1, 2, 3});
-            ConversationCheckpoint cp;
-            cp.ids = {1, 2};
-            big.checkpoints.push_back(cp);
-            const size_t one = big.bytes();
-            ConversationCache small(one + image({9, 8, 7}).bytes(), 8);
-            small.set_spill_hooks(hooks);
-            small.set_spill_clock([&] { return clock_now; });
-            small.set_spill_cooldown(120.0);
-            check(small.put(std::move(big)) && small.put(image({9, 8, 7})), "parked");
-            clock_now += 200.0;
-            check(small.put(image({5, 6, 7})) && small.spills() == 1, "the first copy spilled");
-            auto newer = image({1, 2, 3, 30, 31});   // the same conversation, one turn later (longer live state)
-            check(small.put(std::move(newer)) && small.spilled_entries() == 0, "the newer park supersedes the spilled copy");
-            auto bm = small.best(std::vector<int64_t>{1, 2, 3, 30, 31, 40}, {}, true);
-            check(bm.tokens == 5 && !bm.spilled, "the newer copy is in RAM and matches longer");
-        }
-        fs::remove_all(dir);
+        check(c.parks() == 1 && c.spilled_restores() == 0 && c.refused_restores() == 0,
+              "consecutive turns on the same conversation cause zero cache IO");
+        check(c.longest_tokens() == 3, "longest_tokens comes from the manifest");
     }
+    {   // the disk round trip is byte-exact: the K/V and the checkpoint chain read back whole
+        auto c = fresh();
+        SavedConversation big = image({1, 2, 3});
+        ConversationCheckpoint cp;
+        cp.ids = {1, 2};
+        cp.gdn.resize(64, 3);
+        cp.tails.resize(32, 4);
+        big.checkpoints.push_back(cp);
+        big.kv.emplace_back();
+        big.kv.back().k.resize(512, 9);
+        big.kv.back().v.resize(512, 8);
+        ConversationCache keeper(true);
+        keeper.set_spill_hooks(hooks);
+        check(keeper.park(std::move(big)), "parked");
+        const std::vector<int64_t> prompt{1, 2, 3, 4};
+        auto m = keeper.best(prompt, {}, true);
+        SavedConversation back;
+        check(keeper.restore_spilled_exact(m.index, m.tokens, prompt, {}, back) &&
+              back.live.ids == std::vector<int32_t>({1, 2, 3}) &&
+              back.live.gdn.size() == 64 && back.live.gdn[0] == 7 &&
+              back.checkpoints.size() == 1 && back.checkpoints[0].ids == std::vector<int32_t>({1, 2}) &&
+              back.checkpoints[0].gdn.size() == 64 && back.checkpoints[0].gdn[10] == 3 &&
+              back.checkpoints[0].tails.size() == 32 && back.checkpoints[0].tails[5] == 4 &&
+              back.kv.size() == 1 && back.kv[0].k.size() == 512 && back.kv[0].v.size() == 512,
+              "the parked state reads back byte-exact: live, checkpoint chain and K/V included");
+        check(keeper.spilled_entries() == 0 && keeper.spilled_restores() == 1, "the manifest record goes on restore");
+        check(keeper.best(prompt, {}, true).tokens == 0, "the restored state is the caller's active state now");
+    }
+    {   // restore through a checkpoint mark (a rewind's resume point) keeps the chain and the K/V consistent
+        auto c = fresh();
+        SavedConversation big = image({1, 2, 3});
+        ConversationCheckpoint cp;
+        cp.ids = {1, 2};
+        cp.gdn.resize(64, 5);
+        big.checkpoints.push_back(cp);
+        big.kv.emplace_back();
+        big.kv.back().k.resize(256, 2);
+        check(c.park(std::move(big)), "parked");
+        const std::vector<int64_t> edited{1, 2, 9, 4};   // the suffix the client rewrote
+        const std::vector<int64_t> empty;
+        auto m = c.best(edited, {}, true);
+        check(m.spilled && m.tokens == 2, "the checkpoint boundary matches the edited prompt");
+        check(c.best(std::vector<int64_t>{1, 2}, {}, true).tokens == 0, "equal-length mark cannot consume the last token");
+        check(c.best(std::vector<int64_t>{1}, {}, true).tokens == 0 && c.best(empty, {}, true).tokens == 0,
+              "short and empty prompts cannot match");
+        SavedConversation back;
+        check(c.restore_spilled_exact(m.index, m.tokens, edited, {}, back) &&
+              back.checkpoints.size() == 1 && back.checkpoints[0].ids == std::vector<int32_t>({1, 2}) &&
+              back.kv[0].k.size() == 256, "the rewind restores from the checkpoint with its K/V");
+    }
+    {   // steering mode and images isolate the manifest, exactly as the RAM prefix match did
+        auto c = fresh();
+        SavedConversation s = image({1, 2, 3});
+        s.live.imgs = {{1, 123}};
+        s.checkpoints.push_back(ConversationCheckpoint{});
+        s.checkpoints.back().ids = {1, 2};
+        check(c.park(std::move(s)), "parked");
+        const std::vector<int64_t> a{1, 2, 3, 4};
+        check(c.best(a, {}, false).tokens == 0, "the other steering mode does not match");
+        check(c.best(a, {{1, 123}}, true).tokens == 3, "the same image can resume");
+        check(c.best(a, {{1, 124}}, true).tokens == 0, "different image pixels invalidate the same pad tokens");
+        check(c.best(a, {}, true).tokens == 2, "a missing later image still resumes from the checkpoint");
+        check(c.best(a, {{1, 123}, {2, 45}}, true).tokens == 0, "an additional image inside the prefix invalidates");
+        check(c.best(a, {{1, 123}, {3, 45}}, true).tokens == 3, "an image after the prefix does not invalidate");
+    }
+    {   // B-F3: the exact re-verification refuses a read whose bytes do not hold the recorded state
+        auto c = fresh();
+        check(c.park(image({1, 2, 3})), "parked");
+        swap_image = true;   // the file now yields a state the manifest never recorded
+        const std::vector<int64_t> prompt{1, 2, 3, 4};
+        auto m = c.best(prompt, {}, true);
+        check(m.spilled, "the manifest still matches");
+        SavedConversation back;
+        check(!c.restore_spilled_exact(m.index, m.tokens, prompt, {}, back), "the foreign state is refused");
+        check(c.spilled_entries() == 0 && on_disk() == 0 && c.refused_restores() == 0,
+              "a verification miss deletes the file and the record (fail-closed)");
+        check(!c.last_error().empty(), "the verification miss is reported");
+        swap_image = false;
+    }
+    {   // B-F2: a read the RAM admission refuses keeps the file and the record - refused is not corrupt
+        auto c = fresh();
+        check(c.park(image({1, 2, 3})), "parked");
+        refuse_read = true;
+        const std::vector<int64_t> prompt{1, 2, 3, 4};
+        auto m = c.best(prompt, {}, true);
+        SavedConversation back;
+        check(!c.restore_spilled_exact(m.index, m.tokens, prompt, {}, back), "the refused read does not restore");
+        check(c.refused_restores() == 1 && c.spilled_entries() == 1 && on_disk() == 1,
+              "the refused entry keeps its file and its manifest record");
+        refuse_read = false;
+        check(c.restore_spilled_exact(m.index, m.tokens, prompt, {}, back) &&
+              back.live.ids == std::vector<int32_t>({1, 2, 3}),
+              "once the admission allows it, the same record restores");
+    }
+    {   // a corrupt file, and a file under another identity, are deleted with their records
+        auto c = fresh();
+        check(c.park(image({1, 2, 3})), "parked");
+        const std::vector<int64_t> prompt{1, 2, 3, 4};
+        auto m = c.best(prompt, {}, true);
+        check(m.spilled, "the manifest matches");
+        fs::resize_file(spill_files.back(), 8);   // truncate the file: the payload hash fails
+        SavedConversation back;
+        check(!c.restore_spilled_exact(m.index, m.tokens, prompt, {}, back), "the corrupt file refuses to read");
+        check(c.spilled_entries() == 0 && on_disk() == 0, "the corrupt entry is deleted and dropped (fail-open)");
+        check(c.park(image({7, 8, 9})), "the cache keeps working after a dropped entry");
+        auto m2 = c.best(std::vector<int64_t>{7, 8, 9, 1}, {}, true);
+        check(m2.spilled && m2.tokens == 3, "the new entry matches");
+        // identity flip and unreadable files: the read refuses before any state is used, the entry is deleted
+        for (const auto& e : fs::directory_iterator(dir))
+            if (e.is_regular_file()) fs::resize_file(e.path(), 0);
+        SavedConversation back2;
+        check(!c.restore_spilled_exact(m2.index, m2.tokens, std::vector<int64_t>{7, 8, 9, 1}, {}, back2),
+              "an unreadable file refuses too");
+        check(c.spilled_entries() == 0 && on_disk() == 0, "the foreign entry is deleted and dropped");
+    }
+    {   // fail-open: a park write that fails drops the state (the same loss as before) and leaves nothing behind
+        auto c = fresh();
+        fail_write = true;
+        check(!c.park(image({1, 2, 3})), "a failed write does not park");
+        check(c.failed_parks() == 1 && c.parks() == 0 && c.spilled_entries() == 0,
+              "the failure is counted and leaves no record");
+        check(!c.last_error().empty(), "the park failure is reported");
+        check(on_disk() == 0 && dot_files() == 0, "no half-written file and no temporary orphan is left behind");
+        fail_write = false;
+        check(c.park(image({1, 2, 3})), "the cache keeps parking after a failure");
+        check(c.spilled_entries() == 1, "the next park lands");
+    }
+    {   // A-F1: a layer split's stage images do not park (format v1 does not carry them)
+        auto c = fresh();
+        SavedConversation split = image({1, 2, 3});
+        split.stage_images.push_back(SavedConversation{});
+        check(!c.park(std::move(split)), "stage images are refused");
+        check(c.failed_parks() == 1 && c.spilled_entries() == 0 && on_disk() == 0,
+              "the refusal drops the state and writes nothing");
+    }
+    {   // superseded spilled copies leave with their files when the same conversation parks a newer state
+        auto c = fresh();
+        SavedConversation old = image({1, 2, 3});
+        ConversationCheckpoint cp;
+        cp.ids = {1, 2};
+        old.checkpoints.push_back(cp);
+        check(c.park(std::move(old)), "the older copy parked");
+        check(c.park(image({7, 8, 9})), "another conversation parked");
+        check(on_disk() == 2 && c.spilled_entries() == 2, "two files on disk");
+        SavedConversation newer = image({1, 2, 3, 30, 31});   // the same conversation, one turn later
+        newer.checkpoints.push_back(ConversationCheckpoint{});
+        newer.checkpoints.back().ids = {1, 2, 3};
+        newer.checkpoints.push_back(ConversationCheckpoint{});
+        newer.checkpoints.back().ids = {1, 2};
+        check(c.drop_superseded(newer.live.ids, newer.live.imgs, newer.checkpoints, true) == 1 &&
+              c.spilled_entries() == 1 && on_disk() == 1,
+              "the newer park supersedes the older copy: file and record go together");
+        check(c.park(std::move(newer)), "the newer state parks (the engine drops the stale copy first)");
+        auto kept = c.best(std::vector<int64_t>{7, 8, 9, 1}, {}, true);
+        check(kept.spilled && kept.tokens == 3, "the unrelated conversation is kept");
+        auto bm = c.best(std::vector<int64_t>{1, 2, 3, 30, 31, 40}, {}, true);
+        check(bm.tokens == 5, "the newer copy matches through its own marks");
+    }
+    {   // a disabled cache parks nothing and matches nothing
+        ConversationCache off(false);
+        const std::vector<int64_t> off_prompt{1, 2, 3, 4};
+        check(!off.park(image({1, 2, 3})), "a disabled cache parks nothing");
+        check(off.best(off_prompt, {}, true).tokens == 0, "a disabled cache has no matches");
+    }
+    fs::remove_all(dir);
     std::printf("conversation_cache_test: %d checks passed\n", checks);
 }

@@ -1261,7 +1261,16 @@ size_t conversation_spill_clear_dir(const std::string& dir, const char* prefix, 
     for (std::filesystem::directory_iterator it(dir, ec), end; !ec && it != end; it.increment(ec)) {
         if (!it->is_regular_file(ec) || ec) continue;
         const std::string name = it->path().filename().string();
-        if (name.size() < plen || std::memcmp(name.data(), prefix, plen) != 0) continue;
+        // Our own files: `spill-N.bin`, and the temporary orphan a crashed write left behind -
+        // `.<prefix><leaf>.<hex>.tmp` (temp_name below); anything else belongs to someone else.
+        bool ours = name.size() >= plen && std::memcmp(name.data(), prefix, plen) == 0;
+        if (!ours && name.size() > plen + 5 && name[0] == '.' &&
+            std::memcmp(name.data() + 1, prefix, plen) == 0 &&
+            std::memcmp(name.data() + name.size() - 4, ".tmp", 4) == 0) {
+            const std::string middle = name.substr(plen + 1, name.size() - plen - 5);
+            ours = !middle.empty() && middle.find('.') != std::string::npos;   // a leaf part and a hex part
+        }
+        if (!ours) continue;
         if (std::filesystem::remove(it->path(), ec) && !ec) ++removed;
         else if (ec) { error = "spill: cannot remove " + it->path().string() + ": " + ec.message(); break; }
     }

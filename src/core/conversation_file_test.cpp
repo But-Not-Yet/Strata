@@ -759,11 +759,15 @@ int main() {
         spit(spill / "spill-abc-1.bin", std::vector<char>(5, 'x'));
         spit(spill / "spill-def-2.bin", std::vector<char>(5, 'y'));
         spit(spill / "spill-ghi-3.bin", std::vector<char>(5, 'z'));
+        spit(spill / ".spill-7.deadbeef.tmp", std::vector<char>(3, 't'));   // a crashed write's temporary orphan
+        spit(spill / ".spill-8.tmp", std::vector<char>(3, 'u'));            // the prefix without a suffix: kept
         spit(spill / "keep.txt", std::vector<char>(2, 'k'));
         spit(spill / "sub" / "spill-jkl-4.bin", std::vector<char>(5, 'w'));
         std::string clear_error;
         const size_t removed = conversation_spill_clear_dir(spill.string(), "spill-", clear_error);
-        check(removed == 3 && clear_error.empty(), "the restart clears the spill files of a previous run");
+        check(removed == 4 && clear_error.empty(), "the restart clears the spill files and the temporary orphans");
+        check(!fs::exists(spill / ".spill-7.deadbeef.tmp"), "the temporary orphan is gone");
+        check(fs::exists(spill / ".spill-8.tmp"), "a dot file that is not a write's temporary is left alone");
         check(!fs::exists(spill / "spill-abc-1.bin") && !fs::exists(spill / "spill-def-2.bin") &&
               !fs::exists(spill / "spill-ghi-3.bin"), "the spill files are gone");
         check(fs::exists(spill / "keep.txt") && fs::exists(spill / "sub" / "spill-jkl-4.bin"),

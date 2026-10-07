@@ -239,93 +239,165 @@ int64_t conversation_prefix(const ConversationCheckpoint& c, const std::vector<T
     return (int64_t) n;
 }
 
+// Disk-authoritative conversation cache (park-on-displacement): a parked conversation lives only in a session
+// file (format v1); the cache keeps a RAM manifest of key hashes and nothing else.  A conversation is parked
+// exactly when it is displaced (the engine parks the outgoing live state BEFORE the incoming one is read - two
+// live K/V states must never be held at once), restored when it comes back, and untouched (zero cache IO) while
+// it stays active.  A park write that fails is fail-open: the state is dropped, the same loss the pre-disk cache
+// had, and no request ever waits on the disk.  A restore read is triaged: the RAM admission's refusal keeps the
+// file and its record (refused is not corrupt); corruption or a foreign identity deletes both; a read that
+// succeeds is re-verified token-exactly against the prompt before it becomes the active state (a 64-bit key-hash
+// collision would otherwise silently poison the K/V).
 class ConversationCache {
 public:
     struct Match {
-        size_t index = 0;      // entries_ index; with spilled: the manifest's index
+        size_t index = 0;      // the manifest's index
         int64_t tokens = 0;
-        bool live = false;
-        bool spilled = false;  // the match lives in a session file; restore_spilled reads it back
+        bool live = false;     // false: every match is a manifest record
+        bool spilled = true;
     };
 
-    // The engine's wiring of the disk tier (generate.cpp fills it).  `write` serializes one entry (session file
-    // format v1); `read` refuses a foreign identity or a corrupt file (fail-closed, the caller drops the entry);
-    // `remove` deletes the file behind a manifest record.  `admit_write` is the RAM preflight of a spill write
-    // (the transient dirty pages of the serialization): false = do not write to disk now.
+    // The engine's wiring of the disk (generate.cpp fills it).  `write` serializes one entry (session file
+    // format v1) and owns its temporary file; `read` refuses a foreign identity or a corrupt file (fail-closed)
+    // and reports whether a false return was the RAM admission's refusal (the file is intact: B-F2); `remove`
+    // deletes the file behind a manifest record.
     struct SpillHooks {
         std::string dir;
         std::function<bool(const SavedConversation&, const std::string& path, std::string& error)> write;
-        std::function<bool(const std::string& path, SavedConversation& out, std::string& error)> read;
+        std::function<bool(const std::string& path, SavedConversation& out, std::string& error, bool& admission_refused)> read;
         std::function<bool(const std::string& path)> remove;
-        std::function<bool(size_t need_bytes)> admit_write;
     };
 
-    // The manifest record of one spilled entry: the key hashes (live state first, then the checkpoints), the live
+    // The manifest record of one parked entry: the key hashes (live state first, then the checkpoints), the live
     // state's token count, the geometry it was captured with, and the file.
     struct Spilled {
         std::vector<std::pair<uint64_t, int64_t>> marks;   // (key hash, token count)
-        int64_t tokens = 0;                                // the live state's tokens at spill time
+        int64_t tokens = 0;                                // the live state's tokens at park time
         std::array<int64_t, 18> geometry{};
         bool cvec = true;
-        size_t bytes = 0;                                  // the RAM the spill freed
+        size_t bytes = 0;                                  // the file's payload, for the accounting
         std::string path;
     };
 
-    ConversationCache(size_t budget, size_t slots) : budget_(budget), slots_(slots) {}
-    bool enabled() const { return budget_ != 0 && slots_ != 0; }
-    size_t bytes() const { return bytes_ + reuse_.bytes(); }
-    size_t size() const { return entries_.size(); }
-    size_t evictions() const { return evictions_; }
-    // the longest parked conversation, in tokens (--kv-grow keeps the K/V that long while it could be restored);
-    // spilled entries count too: their K/V must still be restorable (their host RAM is gone, the cells are not)
+    // `reuse_budget`: the optional cap on the transient K/V retained between a restore and the next park (the
+    // --conversation-cache-mib flag's one remaining use); 0 retains nothing.
+    explicit ConversationCache(bool enabled, size_t reuse_budget = 0)
+        : enabled_(enabled), reuse_budget_(reuse_budget) {}
+    bool enabled() const { return enabled_; }
+    size_t bytes() const { return reuse_.bytes(); }
+    // the longest parked conversation, in tokens (--kv-grow keeps the K/V that long while it could be restored;
+    // the parked states live on disk, their host RAM is gone, the cells are not)
     int64_t longest_tokens() const {
         int64_t n = 0;
-        for (const auto& e : entries_) n = std::max<int64_t>(n, (int64_t) e.live.ids.size());
         for (const auto& s : spilled_) n = std::max<int64_t>(n, s.tokens);
         return n;
     }
-    // --- spill state ---
     void set_spill_hooks(SpillHooks hooks) {
         hooks_ = std::move(hooks);
         spill_ready_ = !hooks_.dir.empty() && (bool) hooks_.write && (bool) hooks_.read;
     }
     bool spill_ready() const { return spill_ready_; }
-    void set_spill_cooldown(double seconds) { spill_cooldown_s_ = seconds; }
-    void set_spill_clock(std::function<double()> now) { spill_clock_ = std::move(now); }
-    size_t spills() const { return spills_; }
+
+    // --- counters (the acceptance criteria read these) ---
+    size_t parks() const { return parks_; }
+    size_t failed_parks() const { return failed_parks_; }
     size_t spilled_entries() const { return spilled_.size(); }
     size_t spilled_bytes() const { return spilled_bytes_; }
     size_t spilled_restores() const { return spilled_restores_; }
-    size_t failed_spills() const { return failed_spills_; }
-    double spill_ms() const { return spill_ms_; }
-    const std::string& last_spill_error() const { return last_spill_error_; }
+    size_t refused_restores() const { return refused_restores_; }
+    size_t superseded() const { return superseded_; }
+    double park_ms() const { return park_ms_; }
+    const std::string& last_error() const { return last_error_; }
 
-    // Spill one eligible entry (oldest first) to disk and free its RAM without an eviction: the gate-refusal loop's
-    // unit of work.  False when nothing is eligible (pins, the hysteresis cooldown) or the write failed — nothing
-    // is dropped on a failure (fail-open keeps the current behaviour at the gate).
-    bool spill_one() {
-        if (!spill_ready_) return false;
-        for (size_t i = 0; i < entries_.size(); ++i)
-            if (spill_write(i)) {
-                bytes_ -= entries_[i].bytes();
-                entries_.erase(entries_.begin() + (std::ptrdiff_t) i);
-                metas_.erase(metas_.begin() + (std::ptrdiff_t) i);
-                return true;
+    // The manifest match: the longest recorded prefix that the prompt's digests reproduce.  Pure arithmetic over
+    // the manifest - no file is read, nothing is written (an active conversation touches nothing here).
+    template<class Token>
+    Match best(const std::vector<Token>& prompt, const std::vector<ConversationImageKey>& images, bool cvec) const {
+        Match best;
+        if (!spill_ready_) return best;
+        std::vector<uint64_t> dig;
+        conversation_spill_prefix_digests(prompt.begin(), prompt.end(), dig);
+        for (size_t i = spilled_.size(); i-- > 0;) {
+            const auto& s = spilled_[i];
+            if (s.cvec != cvec) continue;
+            for (const auto& [key, n] : s.marks) {
+                if (n <= 0 || n >= (int64_t) prompt.size() || n <= best.tokens) continue;
+                if (conversation_spill_key_at(dig, n, images.data(), images.size()) == key)
+                    best = {i, n, false, true};
             }
-        return false;
+        }
+        return best;
     }
-    // Read a spilled entry back; the manifest record goes (the image becomes the caller's active state).  A file
-    // that no longer reads (corrupt, identity changed) is dropped from the manifest with its file: fail-open.
-    bool restore_spilled(size_t index, SavedConversation& out) {
+
+    // Park a displaced conversation: serialize it into the spill directory, add the manifest record, and free its
+    // RAM (the image is consumed either way).  False is fail-open: the write failed, the state is dropped (the
+    // same loss the pre-disk cache had); no record exists and no half-written file is left behind.
+    bool park(SavedConversation&& image) {
+        last_error_.clear();
+        if (!enabled_ || !spill_ready_) {
+            last_error_ = "the conversation cache is disabled";
+            return false;
+        }
+        if (!image.stage_images.empty()) {   // A-F1: format v1 does not carry a layer split's stage images
+            last_error_ = "a layer split's stage images do not park";
+            ++failed_parks_;   // the refusal drops the state, the same loss as a failed write
+            return false;
+        }
+        Spilled m;
+        m.tokens = (int64_t) image.live.ids.size();
+        m.geometry = image.geometry;
+        m.cvec = image.cvec;
+        m.bytes = image.bytes();
+        if (!image.live.ids.empty())
+            m.marks.push_back({conversation_spill_key(image.live.ids, image.live.imgs), m.tokens});
+        for (const auto& c : image.checkpoints)
+            if (!c.ids.empty())
+                m.marks.push_back({conversation_spill_key(c.ids, c.imgs), (int64_t) c.ids.size()});
+        m.path = hooks_.dir + "/spill-" + std::to_string(++spill_seq_) + ".bin";
+        const double t0 = now();
+        std::string error;
+        if (!hooks_.write(image, m.path, error)) {
+            ++failed_parks_;
+            last_error_ = error.empty() ? "the park write failed" : error;
+            if (hooks_.remove) hooks_.remove(m.path);   // never a half-written file at the record's path
+            return false;
+        }
+        park_ms_ += (now() - t0) * 1000.0;
+        ++parks_;
+        spilled_bytes_ += m.bytes;
+        spilled_.push_back(std::move(m));
+        return true;
+    }
+
+    // Restore the record at `index`: read its file back, re-verify the state the record promised token-exactly
+    // against this prompt (B-F3: the key hash matched, the tokens must too), and hand the image to the caller.
+    // Triage on failure: an admission refusal keeps the file and the record (WARNING only - refused is not
+    // corrupt, B-F2); anything else (corrupt, foreign identity, a verification miss) deletes both, so a poisoned
+    // entry cannot match again.
+    template<class Token>
+    bool restore_spilled_exact(size_t index, int64_t tokens, const std::vector<Token>& prompt,
+                               const std::vector<ConversationImageKey>& images, SavedConversation& out) {
         out = {};
         if (index >= spilled_.size()) return false;
+        bool refused = false;
         std::string error;
-        const bool ok = hooks_.read && hooks_.read(spilled_[index].path, out, error);
+        const bool ok = hooks_.read && hooks_.read(spilled_[index].path, out, error, refused);
         if (!ok) {
-            last_spill_error_ = error.empty() ? "the spilled session file does not read back" : error;
-            if (hooks_.remove) hooks_.remove(spilled_[index].path);
-            spilled_bytes_ -= spilled_[index].bytes;
-            spilled_.erase(spilled_.begin() + (std::ptrdiff_t) index);
+            last_error_ = error.empty() ? "the session file does not read back" : error;
+            if (refused) {   // B-F2: the RAM admission turned the read down; the file and its record stay
+                ++refused_restores_;
+                return false;
+            }
+            drop_spilled(index);
+            return false;
+        }
+        bool verified = tokens > 0 && conversation_prefix(out.live, prompt, images) == tokens;
+        for (size_t j = 0; !verified && j < out.checkpoints.size(); ++j)
+            verified = conversation_prefix(out.checkpoints[j], prompt, images) == tokens;
+        if (!verified) {
+            last_error_ = "the restored state does not match the prompt token-exactly "
+                          "(a key-hash collision or a stale file)";
+            drop_spilled(index);
             return false;
         }
         ++spilled_restores_;
@@ -334,105 +406,12 @@ public:
         return true;
     }
 
-    // Retain only the restored K/V buffers, not duplicate running checkpoints.
-    // This optimization never evicts a parked conversation to make itself fit.
-    // `stage_kv`: with a layer split, the later stages' restored K/V (one per stage), retained with the first's.
-    void retain(std::vector<ConversationKv>&& kv, int64_t tokens,
-                std::vector<std::vector<ConversationKv>>&& stage_kv = {}) {
-        reuse_ = {};
-        ConversationKvReuse candidate{std::move(kv), tokens, tokens, {}};
-        for (auto& k : stage_kv) candidate.stages.push_back(ConversationKvReuse{std::move(k), tokens, tokens, {}});
-        if (enabled() && candidate.bytes() <= budget_ - bytes_) reuse_ = std::move(candidate);
-    }
-    void limit_reuse(int64_t first_dirty) {
-        reuse_.unchanged_tokens = std::min(reuse_.unchanged_tokens, first_dirty);
-        for (auto& s : reuse_.stages) s.unchanged_tokens = std::min(s.unchanged_tokens, first_dirty);
-        if (reuse_.unchanged_tokens <= 0) reuse_ = {};
-    }
-    ConversationKvReuse take_reuse() { return std::exchange(reuse_, {}); }
-    size_t retained_bytes() const { return reuse_.bytes(); }
-    bool can_fit(size_t incoming, size_t held = 0) const {
-        return enabled() && held <= budget_ && incoming <= budget_ - held &&
-               entries_.size() < slots_ && bytes() <= budget_ - held - incoming;
-    }
-
-    template<class Token>
-    Match best(const std::vector<Token>& prompt, const std::vector<ConversationImageKey>& images, bool cvec) const {
-        Match best;
-        // Ties prefer the most recently parked branch. The caller prefers its
-        // already-active state when that offers the same prefix length.
-        for (size_t i = entries_.size(); i-- > 0;) {
-            const auto& e = entries_[i];
-            if (e.cvec != cvec) continue;
-            auto consider = [&](const ConversationCheckpoint& c, bool live) {
-                const int64_t n = conversation_prefix(c, prompt, images);
-                if (n > best.tokens) best = {i, n, live, false};
-            };
-            consider(e.live, true);
-            for (const auto& c : e.checkpoints) consider(c, false);
-        }
-        // the disk tier: a spilled entry matches through its manifest marks (the live state and each checkpoint).
-        // Only a strictly longer prefix than the best RAM match wins: a restore costs a file read.
-        if (!spilled_.empty() && spill_ready_) {
-            std::vector<uint64_t> dig;
-            conversation_spill_prefix_digests(prompt.begin(), prompt.end(), dig);
-            for (size_t i = spilled_.size(); i-- > 0;) {
-                const auto& s = spilled_[i];
-                if (s.cvec != cvec) continue;
-                for (const auto& [key, n] : s.marks) {
-                    if (n <= 0 || n >= (int64_t) prompt.size() || n <= best.tokens) continue;
-                    if (conversation_spill_key_at(dig, n, images.data(), images.size()) == key)
-                        best = {i, n, false, true};
-                }
-            }
-        }
-        return best;
-    }
-
-    SavedConversation take(size_t index) {
-        SavedConversation out = std::move(entries_.at(index));
-        bytes_ -= out.bytes();
-        entries_.erase(entries_.begin() + (std::ptrdiff_t) index);
-        metas_.erase(metas_.begin() + (std::ptrdiff_t) index);
-        return out;
-    }
-
-    // Reserve before allocating a snapshot. held is an incoming image removed
-    // with take() but still alive during the exchange; count it against RAM too.
-    bool make_room(size_t incoming, size_t held = 0) {
-        if (!enabled() || held > budget_ || incoming > budget_ - held) return false;
-        if (bytes() > budget_ - held - incoming) reuse_ = {};
-        while (!entries_.empty() && (entries_.size() >= slots_ || bytes_ > budget_ - held - incoming)) {
-            // the oldest entry that does not hold a pinned shared prefix leaves; with only pinned ones left the new
-            // image does not fit (the pinned prefix is what the queries come back to).  With the disk tier wired,
-            // the victim is spilled first (the plan's active path: the budget eviction writes a session file instead
-            // of dropping); a spill that fails is refused falls back to the drop.  A victim inside the hysteresis
-            // cooldown is not evicted at all — the parking is refused rather than thrashing (or dropping) a fresh
-            // conversation; later candidates are still tried.
-            bool evicted = false;
-            for (size_t i = 0; i < entries_.size(); ++i) {
-                if (entries_[i].pinned()) continue;
-                if (spill_ready_ && now() - metas_[i].last_activity < spill_cooldown_s_) continue;
-                spill_write(i);   // spilled, or failed -> the current behaviour: dropped
-                bytes_ -= entries_[i].bytes();
-                entries_.erase(entries_.begin() + (std::ptrdiff_t) i);
-                metas_.erase(metas_.begin() + (std::ptrdiff_t) i);
-                ++evictions_;
-                evicted = true;
-                break;
-            }
-            if (!evicted) return false;
-        }
-        return true;
-    }
-
-    // #342: drop the parked entries an outgoing conversation (its live tokens and checkpoint chain) supersedes:
+    // #342: drop the parked records the outgoing conversation (its live tokens and checkpoint chain) supersedes:
     // the same conversation a turn back, whose DEEPEST checkpoint the outgoing chain still holds, so all it adds
     // is the tail the client rewrote (the reply as it was generated, before the next request re-rendered it) and
-    // checkpoints older than that one.  A subagent's successive turns parked one such copy each, and make_room's
-    // oldest-first eviction then pushed the parent conversation out after `slots` turns.  An entry without
-    // checkpoints, or whose deepest checkpoint the outgoing chain does not hold (another conversation that only
-    // shares the system prompt's root with it), is kept.  Returns how many were dropped.
+    // checkpoints older than that one.  A record without checkpoints, or whose deepest mark the outgoing chain
+    // does not hold (another conversation that only shares the system prompt's root with it), is kept.  Returns
+    // how many were dropped.
     size_t drop_superseded(const std::vector<int32_t>& ids, const std::vector<ConversationImageKey>& images,
                            const std::vector<ConversationCheckpoint>& checkpoints, bool cvec) {
         auto held = [&](const ConversationCheckpoint& c) {
@@ -442,22 +421,6 @@ public:
             return false;
         };
         size_t dropped = 0;
-        for (size_t i = 0; i < entries_.size();) {
-            const auto& e = entries_[i];
-            const ConversationCheckpoint* deepest = nullptr;
-            for (const auto& c : e.checkpoints)
-                if (!deepest || c.ids.size() > deepest->ids.size()) deepest = &c;
-            if (e.cvec == cvec && deepest && !deepest->ids.empty() && held(*deepest)) {
-                bytes_ -= e.bytes();
-                entries_.erase(entries_.begin() + (std::ptrdiff_t) i);
-                metas_.erase(metas_.begin() + (std::ptrdiff_t) i);
-                ++dropped;
-                continue;
-            }
-            ++i;
-        }
-        // the disk tier: a spilled copy whose deepest mark the outgoing chain holds is stale the same way — its
-        // file goes with the manifest record (the newer park carries its content forward)
         if (!spilled_.empty()) {
             std::vector<uint64_t> dig;
             conversation_spill_prefix_digests(ids.begin(), ids.end(), dig);
@@ -477,9 +440,7 @@ public:
                         if ((int64_t) k.ids.size() == deepest.second &&
                             conversation_spill_key(k.ids, k.imgs) == deepest.first) { stale = true; break; }
                 if (stale) {
-                    if (hooks_.remove) hooks_.remove(s.path);
-                    spilled_bytes_ -= s.bytes;
-                    spilled_.erase(spilled_.begin() + (std::ptrdiff_t) i);
+                    drop_spilled(i);
                     ++dropped;
                 }
             }
@@ -487,80 +448,45 @@ public:
         superseded_ += dropped;
         return dropped;
     }
-    size_t superseded() const { return superseded_; }
 
-    bool put(SavedConversation&& image, size_t held = 0) {
-        const size_t n = image.bytes();
-        if (!enabled() || held > budget_ || n > budget_ - held) return false;   // make_room's refusal, first
-        drop_superseded(image.live.ids, image.live.imgs, image.checkpoints, image.cvec);
-        if (!make_room(n, held)) return false;
-        entries_.push_back(std::move(image));
-        metas_.push_back({now()});
-        bytes_ += n;
-        return true;
+    // Retain only the restored K/V buffers, not duplicate running checkpoints, for the next park's capture.
+    // This retention is transient (it dies with the next park or take_reuse) and capped by `reuse_budget`.
+    // `stage_kv`: with a layer split, the later stages' restored K/V (one per stage), retained with the first's.
+    void retain(std::vector<ConversationKv>&& kv, int64_t tokens,
+                std::vector<std::vector<ConversationKv>>&& stage_kv = {}) {
+        ConversationKvReuse candidate{std::move(kv), tokens, tokens, {}};
+        for (auto& k : stage_kv) candidate.stages.push_back(ConversationKvReuse{std::move(k), tokens, tokens, {}});
+        if (reuse_budget_ != 0 && candidate.bytes() <= reuse_budget_ - reuse_.bytes()) reuse_ = std::move(candidate);
     }
+    void limit_reuse(int64_t first_dirty) {
+        reuse_.unchanged_tokens = std::min(reuse_.unchanged_tokens, first_dirty);
+        for (auto& s : reuse_.stages) s.unchanged_tokens = std::min(s.unchanged_tokens, first_dirty);
+        if (reuse_.unchanged_tokens <= 0) reuse_ = {};
+    }
+    ConversationKvReuse take_reuse() { return std::exchange(reuse_, {}); }
+    size_t retained_bytes() const { return reuse_.bytes(); }
 
 private:
-    struct Meta {
-        double last_activity = 0;   // the clock at put: the hysteresis never spills the recently active entries
-    };
+    void drop_spilled(size_t index) {
+        if (hooks_.remove) hooks_.remove(spilled_[index].path);
+        spilled_bytes_ -= spilled_[index].bytes;
+        spilled_.erase(spilled_.begin() + (std::ptrdiff_t) index);
+    }
 
     double now() const { return spill_clock_ ? spill_clock_() : std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
 
-    // Serialize entry `idx` into the spill directory and add the manifest record.  False when the tier is off,
-    // the entry is pinned or recently active (hysteresis), the RAM preflight refuses, or the write fails —
-    // every refusal leaves the entry in RAM for the caller's fall-back (fail-open).
-    bool spill_write(size_t idx) {
-        if (!spill_ready_ || idx >= entries_.size()) return false;
-        const SavedConversation& e = entries_[idx];
-        if (e.pinned()) return false;
-        const double t = now();
-        if (t - metas_[idx].last_activity < spill_cooldown_s_) return false;
-        if (hooks_.admit_write && !hooks_.admit_write(e.bytes() + (size_t(32) << 20))) {
-            ++failed_spills_;
-            last_spill_error_ = "RAM admission refused the spill write";
-            return false;
-        }
-        Spilled m;
-        m.tokens = (int64_t) e.live.ids.size();
-        m.geometry = e.geometry;
-        m.cvec = e.cvec;
-        m.bytes = e.bytes();
-        if (!e.live.ids.empty())
-            m.marks.push_back({conversation_spill_key(e.live.ids, e.live.imgs), m.tokens});
-        for (const auto& c : e.checkpoints)
-            if (!c.ids.empty())
-                m.marks.push_back({conversation_spill_key(c.ids, c.imgs), (int64_t) c.ids.size()});
-        m.path = hooks_.dir + "/spill-" + std::to_string(++spill_seq_) + ".bin";
-        std::string error;
-        const double t0 = t;
-        if (!hooks_.write(e, m.path, error)) {
-            ++failed_spills_;
-            last_spill_error_ = error.empty() ? "the spill write failed" : error;
-            return false;
-        }
-        last_spill_error_.clear();
-        spill_ms_ += (now() - t0) * 1000.0;
-        ++spills_;
-        spilled_bytes_ += m.bytes;
-        spilled_.push_back(std::move(m));
-        return true;
-    }
-
-    size_t budget_ = 0, slots_ = 0, bytes_ = 0, evictions_ = 0, superseded_ = 0;
-    std::deque<SavedConversation> entries_; // least recently active first
-    std::deque<Meta> metas_;                // parallel to entries_
+    bool enabled_ = false;
+    size_t reuse_budget_ = 0;
     ConversationKvReuse reuse_;
-    // the disk tier
     SpillHooks hooks_;
     bool spill_ready_ = false;
-    double spill_cooldown_s_ = 120.0;
     std::function<double()> spill_clock_;
-    std::deque<Spilled> spilled_;           // the RAM manifest: oldest spill first
+    std::deque<Spilled> spilled_;           // the RAM manifest: oldest park first
     uint64_t spill_seq_ = 0;
-    size_t spills_ = 0, spilled_bytes_ = 0, spilled_restores_ = 0, failed_spills_ = 0;
-    double spill_ms_ = 0;
-    std::string last_spill_error_;
+    size_t parks_ = 0, failed_parks_ = 0, spilled_bytes_ = 0, spilled_restores_ = 0, refused_restores_ = 0,
+           superseded_ = 0;
+    double park_ms_ = 0;
+    std::string last_error_;
 };
 
 } // namespace strata::core
