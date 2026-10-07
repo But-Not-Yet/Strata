@@ -6985,6 +6985,30 @@ int main(int argc, char** argv) {
                 std::filesystem::remove(path, ec);
                 return !ec;
             };
+            const std::string spill_dir = o.conversation_cache_dir;
+            hooks.reap = [spill_dir](const std::vector<std::string>& keep, size_t& dir_bytes) {
+                size_t removed = 0;
+                dir_bytes = 0;
+                std::error_code ec;
+                for (const auto& e : std::filesystem::directory_iterator(spill_dir, ec)) {
+                    if (ec) break;
+                    if (!e.is_regular_file(ec) || ec) continue;
+                    const std::string name = e.path().filename().string();
+                    // the manifest's files are spill-<seq>.bin; .tmp orphans belong to the start-up clear
+                    if (name.rfind("spill-", 0) != 0 || name.size() <= 4 ||
+                        name.compare(name.size() - 4, 4, ".bin") != 0)
+                        continue;
+                    bool kept = false;
+                    for (const auto& k : keep) if (k == e.path().string()) { kept = true; break; }
+                    if (kept) {
+                        dir_bytes += (size_t) e.file_size(ec);
+                    } else {
+                        std::error_code rm_ec;
+                        if (std::filesystem::remove(e.path(), rm_ec)) ++removed;
+                    }
+                }
+                return removed;
+            };
             conversations.set_spill_hooks(std::move(hooks));
             }
         }
@@ -7084,14 +7108,20 @@ int main(int argc, char** argv) {
                 }
                 const size_t snapshot_bytes = image.bytes();
                 const bool parked = conversations.park(std::move(image));   // the write frees the RAM (fail-open: a drop)
-                if (parked)
+                if (parked) {
                     std::fprintf(stderr, "strata serve: conversation cache: parked %zu tokens to disk in %.1f ms; "
-                                 "entries=%zu bytes=%zu parks=%zu snapshot_bytes=%zu reused_kv_bytes=%zu\n",
+                                 "entries=%zu bytes=%zu parks=%zu snapshot_bytes=%zu reused_kv_bytes=%zu "
+                                 "dir_bytes=%zu\n",
                                  live.size(),
                                  std::chrono::duration<double, std::milli>(Clock::now() - t0).count(),
                                  conversations.spilled_entries(), conversations.spilled_bytes(),
-                                 conversations.parks(), snapshot_bytes, reused_bytes);
-                else
+                                 conversations.parks(), snapshot_bytes, reused_bytes,
+                                 conversations.dir_bytes());
+                    if (conversations.dir_bytes() > 4 * conversations.max_snapshot_bytes())
+                        std::fprintf(stderr, "strata serve: conversation cache: WARNING: the spill directory holds "
+                                     "%zu bytes, over 4x the largest snapshot (%zu)\n",
+                                     conversations.dir_bytes(), conversations.max_snapshot_bytes());
+                } else
                     std::fprintf(stderr, "strata serve: conversation cache: WARNING: the park write failed (%s); "
                                  "the outgoing conversation is dropped\n", conversations.last_error().c_str());
             } catch (const std::bad_alloc&) {
@@ -9041,15 +9071,19 @@ int main(int argc, char** argv) {
                 return 1;
             }
             std::optional<strata::core::SavedConversation> incoming;
+            int64_t mount_tokens = 0;   // what the restored state may be mounted at (a rewind mounts lower)
             if (will_restore) {
                 // the match lives in a session file: read it back, re-verify the matched prefix token-exactly
                 // (B-F3), and triage the failures - an admission refusal keeps the file (refused is not corrupt,
                 // B-F2); corruption, a foreign identity or a verification miss deletes it; either way the request
-                // proceeds without the parked prefix.
+                // proceeds without the parked prefix.  The match is addressed by the record's unique id: the
+                // park just run may have dropped manifest records in front of it (a capturable index would
+                // dangle - the parked.index of an earlier design read the wrong record or none).
                 const size_t refused0 = conversations.refused_restores();
                 const auto t_read = Clock::now();
                 strata::core::SavedConversation from_disk;
-                if (conversations.restore_spilled_exact(parked.index, parked.tokens, ids, req_imgs, from_disk)) {
+                if (conversations.restore_spilled_exact(parked.id, parked.tokens, ids, req_imgs, from_disk,
+                                                        &mount_tokens)) {
                     std::fprintf(stderr, "strata serve: conversation cache: restored from file (%lld tokens, %.1f ms)\n",
                                  (long long) from_disk.live.ids.size(),
                                  std::chrono::duration<double, std::milli>(Clock::now() - t_read).count());
@@ -9060,8 +9094,8 @@ int main(int argc, char** argv) {
                                  "without the parked prefix\n", conversations.last_error().c_str());
                 } else {
                     std::fprintf(stderr, "strata serve: conversation cache: WARNING: the parked conversation does "
-                                 "not restore (%s); its file is dropped and the request continues without the "
-                                 "parked prefix\n", conversations.last_error().c_str());
+                                 "not restore (corrupt or a verification miss: %s); its file is dropped and the "
+                                 "request continues without the parked prefix\n", conversations.last_error().c_str());
                 }
             }
             if (incoming) slot_source = -1;
@@ -9176,7 +9210,10 @@ int main(int argc, char** argv) {
                     if (!strata::core::conversation_checkpoints_merge(std::move(cs), checks)) checks.clear();
                 }
                 cvec_cached = incoming->cvec;
-                resume = parked.tokens;
+                // the mount: the verified prefix the restore reported - the whole live state, or, when the
+                // prompt is a strict prefix of it (a rewind), the deepest checkpoint at or below the prompt's
+                // boundary (mounted through that checkpoint's own saved running state further below)
+                resume = mount_tokens;
                 from_live = parked.live;
                 if (std::getenv("STRATA_SNAPSHOT_FULL_CAPTURE") == nullptr) {
                     std::vector<std::vector<strata::core::ConversationKv>> stage_kv;   // every stage's, for its next park
