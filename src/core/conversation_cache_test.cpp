@@ -506,6 +506,42 @@ int main() {
         auto bm = c.best(std::vector<int64_t>{1, 2, 3, 30, 31, 40}, {}, true);
         check(bm.tokens == 5, "the newer copy matches through its own marks");
     }
+    {   // a thinking conversation's successive versions supersede each other even when the deepest mark sits
+        // in the re-rendered tail: any mark the outgoing chain reproduces at its depth makes the record stale
+        auto c = fresh();
+        const auto version = [](int32_t tail) {
+            SavedConversation v = image({1, 2, 3, tail});   // the thinking tail is re-rendered every turn
+            ConversationCheckpoint cp;
+            cp.ids = {1, 2, 3};
+            v.checkpoints.push_back(cp);
+            return v;
+        };
+        size_t dropped_total = 0;
+        for (int32_t tail : {10, 20, 30, 40}) {
+            auto v = version(tail);
+            dropped_total += c.drop_superseded(v.live.ids, v.live.imgs, v.checkpoints, true);
+            check(c.park(std::move(v)), "the version parks");
+        }
+        check(dropped_total == 3 && c.spilled_entries() == 1 && c.superseded() == 3,
+              "the same conversation's older versions are dropped turn by turn, only the newest stays");
+        auto bm = c.best(std::vector<int64_t>{1, 2, 3, 40, 50}, {}, true);
+        check(bm.spilled && bm.tokens == 4, "the newest version still matches");
+    }
+    {   // a different conversation that only shares the system root, a cvec mismatch, and a record without
+        // marks are all kept: a key can only repeat on a non-empty shared prefix of the same conversation
+        auto c = fresh();
+        check(c.park(image({1, 2, 3})), "A parked");
+        check(c.park(image({7, 8, 9}, false)), "B parked with a different cvec");
+        SavedConversation markless = image({});
+        check(c.park(std::move(markless)), "a record without marks parked");
+        SavedConversation other = image({1, 2, 3, 99});
+        other.checkpoints.push_back(ConversationCheckpoint{});
+        other.checkpoints.back().ids = {1, 2, 3};
+        check(c.drop_superseded(other.live.ids, other.live.imgs, other.checkpoints, true) == 1,
+              "the matching conversation is dropped");
+        check(c.spilled_entries() == 2 && c.superseded() == 1,
+              "the cvec-mismatched record and the record without marks stay");
+    }
     {   // a disabled cache parks nothing and matches nothing
         ConversationCache off(false);
         const std::vector<int64_t> off_prompt{1, 2, 3, 4};

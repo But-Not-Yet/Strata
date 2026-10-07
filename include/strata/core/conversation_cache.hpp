@@ -473,10 +473,11 @@ public:
     }
 
     // #342: drop the parked records the outgoing conversation (its live tokens and checkpoint chain) supersedes:
-    // the same conversation a turn back, whose DEEPEST checkpoint the outgoing chain still holds, so all it adds
+    // the same conversation a turn back, whose checkpoints the outgoing chain still holds - any mark (the live
+    // state's or a checkpoint's) that the outgoing chain reproduces at that depth makes the record stale, so all it adds
     // is the tail the client rewrote (the reply as it was generated, before the next request re-rendered it) and
-    // checkpoints older than that one.  A record without checkpoints, or whose deepest mark the outgoing chain
-    // does not hold (another conversation that only shares the system prompt's root with it), is kept.  Returns
+    // checkpoints older than that one.  A record with no matching mark, or with no marks at all (another
+    // conversation that only shares the system prompt's root with it), is kept.  Returns
     // how many were dropped.
     size_t drop_superseded(const std::vector<int32_t>& ids, const std::vector<ConversationImageKey>& images,
                            const std::vector<ConversationCheckpoint>& checkpoints, bool cvec) {
@@ -496,15 +497,21 @@ public:
             };
             for (size_t i = spilled_.size(); i-- > 0;) {
                 const auto& s = spilled_[i];
-                std::pair<uint64_t, int64_t> deepest{0, 0};
-                for (const auto& m : s.marks) if (m.second > deepest.second) deepest = m;
-                if (deepest.second <= 0 || s.cvec != cvec) continue;
+                if (s.cvec != cvec) continue;
                 bool stale = false;
-                if (chain_key(deepest.second, images.data(), images.size()) == deepest.first) stale = true;
-                if (!stale)
+                // ANY mark the outgoing chain reproduces at that depth makes the record stale: a thinking
+                // conversation re-renders the tail every turn, so the deepest mark sits in the rewritten
+                // region and never compares equal - a shallower mark (before the fork) still hits.  Two
+                // different conversations cannot share a key on a non-empty prefix, so this cannot drop a
+                // record that only shares the system root.
+                for (const auto& [key, n] : s.marks) {
+                    if (n <= 0) continue;
+                    if (chain_key(n, images.data(), images.size()) == key) { stale = true; break; }
                     for (const auto& k : checkpoints)
-                        if ((int64_t) k.ids.size() == deepest.second &&
-                            conversation_spill_key(k.ids, k.imgs) == deepest.first) { stale = true; break; }
+                        if ((int64_t) k.ids.size() == n &&
+                            conversation_spill_key(k.ids, k.imgs) == key) { stale = true; break; }
+                    if (stale) break;
+                }
                 if (stale) {
                     drop_spilled(i);
                     ++dropped;

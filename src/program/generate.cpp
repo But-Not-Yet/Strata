@@ -7117,13 +7117,20 @@ int main(int argc, char** argv) {
                                  conversations.spilled_entries(), conversations.spilled_bytes(),
                                  conversations.parks(), snapshot_bytes, reused_bytes,
                                  conversations.dir_bytes());
-                    if (conversations.dir_bytes() > 4 * conversations.max_snapshot_bytes())
+                    const size_t entries = conversations.spilled_entries();
+                    const double budget = 1.15 * (double) entries * (double) conversations.max_snapshot_bytes();
+                    if ((double) conversations.dir_bytes() > budget)   // per-entry: 4x total false-alarms on long
                         std::fprintf(stderr, "strata serve: conversation cache: WARNING: the spill directory holds "
-                                     "%zu bytes, over 4x the largest snapshot (%zu)\n",
-                                     conversations.dir_bytes(), conversations.max_snapshot_bytes());
+                                     "%zu bytes over %zu entries, above their budget (%.0f x the largest snapshot, %zu bytes)\n",
+                                     conversations.dir_bytes(), entries,
+                                     conversations.max_snapshot_bytes() ? (double) conversations.dir_bytes() /
+                                                                          (double) conversations.max_snapshot_bytes() : 0.0,
+                                     conversations.max_snapshot_bytes());
                 } else
                     std::fprintf(stderr, "strata serve: conversation cache: WARNING: the park write failed (%s); "
-                                 "the outgoing conversation is dropped\n", conversations.last_error().c_str());
+                                 "the outgoing conversation is dropped; entries=%zu bytes=%zu\n",
+                             conversations.last_error().c_str(), conversations.spilled_entries(),
+                             conversations.spilled_bytes());
             } catch (const std::bad_alloc&) {
                 // The active state has not been touched. Continue with normal
                 // prompt processing rather than killing a serving process.
