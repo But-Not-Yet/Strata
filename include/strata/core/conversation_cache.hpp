@@ -251,7 +251,7 @@ int64_t conversation_prefix(const ConversationCheckpoint& c, const std::vector<T
 class ConversationCache {
 public:
     struct Match {
-        size_t index = 0;      // the manifest's index
+        uint64_t id = 0;       // the manifest record's unique id (stable across drops; never an index)
         int64_t tokens = 0;
         bool live = false;     // false: every match is a manifest record
         bool spilled = true;
@@ -266,11 +266,16 @@ public:
         std::function<bool(const SavedConversation&, const std::string& path, std::string& error)> write;
         std::function<bool(const std::string& path, SavedConversation& out, std::string& error, bool& admission_refused)> read;
         std::function<bool(const std::string& path)> remove;
+        // Reconcile the spill directory against the manifest: remove every spill file not named in `keep`,
+        // return how many were removed, and report the total bytes of the files that remain.  Run at park
+        // time (the only regular writer), so a file a restore or a supersede ever leaked cannot accumulate.
+        std::function<size_t(const std::vector<std::string>& keep, size_t& dir_bytes)> reap;
     };
 
     // The manifest record of one parked entry: the key hashes (live state first, then the checkpoints), the live
     // state's token count, the geometry it was captured with, and the file.
     struct Spilled {
+        uint64_t id = 0;                                   // unique, never reused; restore addresses records by it
         std::vector<std::pair<uint64_t, int64_t>> marks;   // (key hash, token count)
         int64_t tokens = 0;                                // the live state's tokens at park time
         std::array<int64_t, 18> geometry{};
@@ -307,6 +312,14 @@ public:
     size_t refused_restores() const { return refused_restores_; }
     size_t superseded() const { return superseded_; }
     double park_ms() const { return park_ms_; }
+    // the spill directory's total bytes as of the last park's reconciliation (acceptance 9's observable), and
+    // the largest manifest-recorded snapshot
+    size_t dir_bytes() const { return dir_bytes_; }
+    size_t max_snapshot_bytes() const {
+        size_t n = 0;
+        for (const auto& s : spilled_) n = std::max(n, s.bytes);
+        return n;
+    }
     const std::string& last_error() const { return last_error_; }
 
     // The manifest match: the longest recorded prefix that the prompt's digests reproduce.  Pure arithmetic over
@@ -314,7 +327,7 @@ public:
     template<class Token>
     Match best(const std::vector<Token>& prompt, const std::vector<ConversationImageKey>& images, bool cvec) const {
         Match best;
-        if (!spill_ready_) return best;
+        if (!spill_ready_ || spilled_.empty()) return best;   // no manifest, no digest work (the active turn's cost)
         std::vector<uint64_t> dig;
         conversation_spill_prefix_digests(prompt.begin(), prompt.end(), dig);
         for (size_t i = spilled_.size(); i-- > 0;) {
@@ -323,7 +336,7 @@ public:
             for (const auto& [key, n] : s.marks) {
                 if (n <= 0 || n >= (int64_t) prompt.size() || n <= best.tokens) continue;
                 if (conversation_spill_key_at(dig, n, images.data(), images.size()) == key)
-                    best = {i, n, false, true};
+                    best = {s.id, n, false, true};
             }
         }
         return best;
@@ -344,6 +357,7 @@ public:
             return false;
         }
         Spilled m;
+        m.id = ++spill_seq_;
         m.tokens = (int64_t) image.live.ids.size();
         m.geometry = image.geometry;
         m.cvec = image.cvec;
@@ -353,7 +367,7 @@ public:
         for (const auto& c : image.checkpoints)
             if (!c.ids.empty())
                 m.marks.push_back({conversation_spill_key(c.ids, c.imgs), (int64_t) c.ids.size()});
-        m.path = hooks_.dir + "/spill-" + std::to_string(++spill_seq_) + ".bin";
+        m.path = hooks_.dir + "/spill-" + std::to_string(m.id) + ".bin";
         const double t0 = now();
         std::string error;
         if (!hooks_.write(image, m.path, error)) {
@@ -366,24 +380,46 @@ public:
         ++parks_;
         spilled_bytes_ += m.bytes;
         spilled_.push_back(std::move(m));
+        // Reconcile the directory against the manifest: a file a restore or a supersede ever left behind
+        // cannot accumulate (the acceptance bound is on the directory, not on the manifest).
+        if (hooks_.reap) {
+            std::vector<std::string> keep;
+            keep.reserve(spilled_.size());
+            for (const auto& s : spilled_) keep.push_back(s.path);
+            size_t bytes = 0;
+            hooks_.reap(keep, bytes);
+            dir_bytes_ = bytes;
+        }
         return true;
     }
 
-    // Restore the record at `index`: read its file back, re-verify the state the record promised token-exactly
-    // against this prompt (B-F3: the key hash matched, the tokens must too), and hand the image to the caller.
+    // Restore the record with the unique id `id` (an id survives the manifest shifting under drops, which a
+    // capturable index cannot): read its file back, re-verify the state against this prompt token-exactly
+    // (B-F3: the key hash matched, the tokens must too), and hand the image to the caller.  The prompt may be
+    // a strict prefix of the parked state (a rewind): the shared prefix - min(the prompt's usable length, the
+    // state's) tokens - is what is verified and what `*mount_tokens` reports (the deepest checkpoint at or
+    // below the prompt boundary, or the whole live state when it fits); the caller mounts the state there.
     // Triage on failure: an admission refusal keeps the file and the record (WARNING only - refused is not
-    // corrupt, B-F2); anything else (corrupt, foreign identity, a verification miss) deletes both, so a poisoned
-    // entry cannot match again.
+    // corrupt, B-F2); a verification miss or a corrupt/foreign-identity read deletes both, so a poisoned
+    // entry cannot match again; a rewind with no mountable checkpoint keeps both too (the file is intact).
     template<class Token>
-    bool restore_spilled_exact(size_t index, int64_t tokens, const std::vector<Token>& prompt,
-                               const std::vector<ConversationImageKey>& images, SavedConversation& out) {
+    bool restore_spilled_exact(uint64_t id, int64_t tokens, const std::vector<Token>& prompt,
+                               const std::vector<ConversationImageKey>& images, SavedConversation& out,
+                               int64_t* mount_tokens = nullptr) {
         out = {};
-        if (index >= spilled_.size()) return false;
+        size_t index = spilled_.size();
+        for (size_t i = 0; i < spilled_.size(); ++i)
+            if (spilled_[i].id == id) { index = i; break; }
+        if (index == spilled_.size()) {
+            last_error_ = "the manifest record is gone (dropped while this conversation was being parked)";
+            return false;
+        }
         bool refused = false;
         std::string error;
         const bool ok = hooks_.read && hooks_.read(spilled_[index].path, out, error, refused);
         if (!ok) {
-            last_error_ = error.empty() ? "the session file does not read back" : error;
+            last_error_ = error.empty() ? "the session file does not read back (corrupt or a foreign identity)"
+                                        : error;
             if (refused) {   // B-F2: the RAM admission turned the read down; the file and its record stay
                 ++refused_restores_;
                 return false;
@@ -391,16 +427,46 @@ public:
             drop_spilled(index);
             return false;
         }
-        bool verified = tokens > 0 && conversation_prefix(out.live, prompt, images) == tokens;
-        for (size_t j = 0; !verified && j < out.checkpoints.size(); ++j)
-            verified = conversation_prefix(out.checkpoints[j], prompt, images) == tokens;
-        if (!verified) {
-            last_error_ = "the restored state does not match the prompt token-exactly "
-                          "(a key-hash collision or a stale file)";
+        // B-F3: the verified prefix.  The last prompt token starts the next verify window, so a prefix may
+        // cover at most prompt.size() - 1 tokens of any state.
+        const int64_t cap = (int64_t) prompt.size() - 1;
+        auto prefix_ok = [&](const ConversationCheckpoint& c, int64_t limit, int64_t& m) {
+            m = std::min<int64_t>((int64_t) c.ids.size(), limit);
+            if (m <= 0 || !std::equal(c.ids.begin(), c.ids.begin() + m, prompt.begin())) return false;
+            size_t j = 0;
+            for (const auto& image : images) {
+                if (image.start >= m) continue;
+                if (j == c.imgs.size() || !(c.imgs[j++] == image)) return false;
+            }
+            return j == c.imgs.size();
+        };
+        int64_t verified = 0;   // the longest token-verified prefix (B-F3's gate)
+        int64_t mount = 0;      // the longest verified prefix a mountable state carries
+        auto check = [&](const ConversationCheckpoint& c, bool mountable) {
+            int64_t m = 0;
+            if (!prefix_ok(c, cap, m)) return;
+            if (m > verified) verified = m;
+            // a state is mountable only whole (its saved running state is): a live state longer than the
+            // prompt verifies its shared prefix but cannot mount; a checkpoint at or below the boundary can
+            if (mountable && m == (int64_t) c.ids.size() && m > mount) mount = m;
+        };
+        check(out.live, true);
+        for (const auto& c : out.checkpoints) check(c, true);
+        (void) tokens;   // the verified prefix stands on its own token equality, on whichever state carries it
+        if (verified <= 0) {
+            last_error_ = "the restored state does not match the prompt token-exactly (verification miss: "
+                          "a key-hash collision or a stale manifest index)";
             drop_spilled(index);
             return false;
         }
+        if (mount <= 0) {   // intact file, nothing to mount: keep the file and the record (B-F2)
+            last_error_ = "the parked conversation is longer than this prompt and holds no checkpoint at or "
+                          "before its boundary";
+            return false;
+        }
+        if (mount_tokens) *mount_tokens = mount;
         ++spilled_restores_;
+        hooks_.remove(spilled_[index].path);   // the file was consumed: it must not leak on the disk
         spilled_bytes_ -= spilled_[index].bytes;
         spilled_.erase(spilled_.begin() + (std::ptrdiff_t) index);
         return true;
@@ -485,6 +551,7 @@ private:
     uint64_t spill_seq_ = 0;
     size_t parks_ = 0, failed_parks_ = 0, spilled_bytes_ = 0, spilled_restores_ = 0, refused_restores_ = 0,
            superseded_ = 0;
+    size_t dir_bytes_ = 0;
     double park_ms_ = 0;
     std::string last_error_;
 };

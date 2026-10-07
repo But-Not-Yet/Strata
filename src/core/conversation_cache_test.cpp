@@ -197,6 +197,21 @@ int main() {
         return session_file_read(path, file_id, out, bytes, e, {}, nullptr);
     };
     hooks.remove = [](const std::string& path) { std::error_code ec; return fs::remove(path, ec); };
+    hooks.reap = [&](const std::vector<std::string>& keep, size_t& dir_bytes) {
+        size_t removed = 0;
+        dir_bytes = 0;
+        for (const auto& e : fs::directory_iterator(dir)) {
+            if (!e.is_regular_file()) continue;
+            const std::string name = e.path().filename().string();
+            if (name.rfind("spill-", 0) != 0 || name.size() <= 4 || name.compare(name.size() - 4, 4, ".bin") != 0)
+                continue;
+            bool kept = false;
+            for (const auto& k : keep) if (k == e.path().string()) { kept = true; break; }
+            if (kept) dir_bytes += (size_t) e.file_size();
+            else if (fs::remove(e.path())) ++removed;
+        }
+        return removed;
+    };
     const auto on_disk = [&] {
         size_t n = 0;
         for (const auto& e : fs::directory_iterator(dir))
@@ -258,7 +273,7 @@ int main() {
         const std::vector<int64_t> prompt{1, 2, 3, 4};
         auto m = keeper.best(prompt, {}, true);
         SavedConversation back;
-        check(keeper.restore_spilled_exact(m.index, m.tokens, prompt, {}, back) &&
+        check(keeper.restore_spilled_exact(m.id, m.tokens, prompt, {}, back) &&
               back.live.ids == std::vector<int32_t>({1, 2, 3}) &&
               back.live.gdn.size() == 64 && back.live.gdn[0] == 7 &&
               back.checkpoints.size() == 1 && back.checkpoints[0].ids == std::vector<int32_t>({1, 2}) &&
@@ -267,6 +282,7 @@ int main() {
               back.kv.size() == 1 && back.kv[0].k.size() == 512 && back.kv[0].v.size() == 512,
               "the parked state reads back byte-exact: live, checkpoint chain and K/V included");
         check(keeper.spilled_entries() == 0 && keeper.spilled_restores() == 1, "the manifest record goes on restore");
+        check(on_disk() == 0, "the restore deletes the file it consumed (no disk leak)");
         check(keeper.best(prompt, {}, true).tokens == 0, "the restored state is the caller's active state now");
     }
     {   // restore through a checkpoint mark (a rewind's resume point) keeps the chain and the K/V consistent
@@ -287,7 +303,7 @@ int main() {
         check(c.best(std::vector<int64_t>{1}, {}, true).tokens == 0 && c.best(empty, {}, true).tokens == 0,
               "short and empty prompts cannot match");
         SavedConversation back;
-        check(c.restore_spilled_exact(m.index, m.tokens, edited, {}, back) &&
+        check(c.restore_spilled_exact(m.id, m.tokens, edited, {}, back) &&
               back.checkpoints.size() == 1 && back.checkpoints[0].ids == std::vector<int32_t>({1, 2}) &&
               back.kv[0].k.size() == 256, "the rewind restores from the checkpoint with its K/V");
     }
@@ -314,7 +330,7 @@ int main() {
         auto m = c.best(prompt, {}, true);
         check(m.spilled, "the manifest still matches");
         SavedConversation back;
-        check(!c.restore_spilled_exact(m.index, m.tokens, prompt, {}, back), "the foreign state is refused");
+        check(!c.restore_spilled_exact(m.id, m.tokens, prompt, {}, back), "the foreign state is refused");
         check(c.spilled_entries() == 0 && on_disk() == 0 && c.refused_restores() == 0,
               "a verification miss deletes the file and the record (fail-closed)");
         check(!c.last_error().empty(), "the verification miss is reported");
@@ -327,11 +343,11 @@ int main() {
         const std::vector<int64_t> prompt{1, 2, 3, 4};
         auto m = c.best(prompt, {}, true);
         SavedConversation back;
-        check(!c.restore_spilled_exact(m.index, m.tokens, prompt, {}, back), "the refused read does not restore");
+        check(!c.restore_spilled_exact(m.id, m.tokens, prompt, {}, back), "the refused read does not restore");
         check(c.refused_restores() == 1 && c.spilled_entries() == 1 && on_disk() == 1,
               "the refused entry keeps its file and its manifest record");
         refuse_read = false;
-        check(c.restore_spilled_exact(m.index, m.tokens, prompt, {}, back) &&
+        check(c.restore_spilled_exact(m.id, m.tokens, prompt, {}, back) &&
               back.live.ids == std::vector<int32_t>({1, 2, 3}),
               "once the admission allows it, the same record restores");
     }
@@ -343,7 +359,7 @@ int main() {
         check(m.spilled, "the manifest matches");
         fs::resize_file(spill_files.back(), 8);   // truncate the file: the payload hash fails
         SavedConversation back;
-        check(!c.restore_spilled_exact(m.index, m.tokens, prompt, {}, back), "the corrupt file refuses to read");
+        check(!c.restore_spilled_exact(m.id, m.tokens, prompt, {}, back), "the corrupt file refuses to read");
         check(c.spilled_entries() == 0 && on_disk() == 0, "the corrupt entry is deleted and dropped (fail-open)");
         check(c.park(image({7, 8, 9})), "the cache keeps working after a dropped entry");
         auto m2 = c.best(std::vector<int64_t>{7, 8, 9, 1}, {}, true);
@@ -352,9 +368,100 @@ int main() {
         for (const auto& e : fs::directory_iterator(dir))
             if (e.is_regular_file()) fs::resize_file(e.path(), 0);
         SavedConversation back2;
-        check(!c.restore_spilled_exact(m2.index, m2.tokens, std::vector<int64_t>{7, 8, 9, 1}, {}, back2),
+        check(!c.restore_spilled_exact(m2.id, m2.tokens, std::vector<int64_t>{7, 8, 9, 1}, {}, back2),
               "an unreadable file refuses too");
         check(c.spilled_entries() == 0 && on_disk() == 0, "the foreign entry is deleted and dropped");
+    }
+    {   // F1: a manifest record is addressed by its unique id, not by a capturable index - park_current's
+        // drop_superseded runs between best() and restore_spilled_exact and shifts the manifest's indices
+        auto c = fresh();
+        check(c.park(image({1, 2, 3})), "A parked");
+        check(c.park(image({5, 6, 7})), "B parked");
+        check(c.park(image({9, 10, 11})), "C parked");
+        const std::vector<int64_t> c_prompt{9, 10, 11, 12};
+        const auto m = c.best(c_prompt, {}, true);   // captured before the park-time drop, like the engine does
+        SavedConversation newer = image({1, 2, 3, 30});   // A one turn later: its park supersedes A's copy
+        newer.checkpoints.push_back(ConversationCheckpoint{});
+        newer.checkpoints.back().ids = {1, 2, 3};
+        check(c.drop_superseded(newer.live.ids, newer.live.imgs, newer.checkpoints, true) == 1,
+              "the park-time drop removes the record in front of the target");
+        check(c.spilled_entries() == 2, "two records remain");
+        SavedConversation back;
+        check(c.restore_spilled_exact(m.id, m.tokens, c_prompt, {}, back) &&
+              back.live.ids == std::vector<int32_t>({9, 10, 11}),
+              "the restore finds its record by id after the drop shifted the indices");
+        // the same when the record the match pointed at is itself dropped: a clear failure, never a wrong file
+        const std::vector<int64_t> b_prompt{5, 6, 7, 8};
+        const auto m2 = c.best(b_prompt, {}, true);
+        SavedConversation newer_b = image({5, 6, 7, 70});
+        newer_b.checkpoints.push_back(ConversationCheckpoint{});
+        newer_b.checkpoints.back().ids = {5, 6, 7};
+        check(c.drop_superseded(newer_b.live.ids, newer_b.live.imgs, newer_b.checkpoints, true) == 1,
+              "the target record itself is dropped");
+        check(!c.restore_spilled_exact(m2.id, m2.tokens, b_prompt, {}, back) && !c.last_error().empty(),
+              "a dropped record fails with a reported reason, not silently");
+    }
+    {   // the rewind: the prompt is a strict prefix of the parked snapshot - the shared prefix is reused,
+        // mounted at the deepest checkpoint at or below the prompt boundary (no truncation of the file)
+        auto c = fresh();
+        SavedConversation big = image({1, 2, 3, 4, 5, 6, 7, 8, 9, 10});
+        for (int n : {4, 8}) {
+            ConversationCheckpoint cp;
+            cp.ids.assign(n, 0);
+            for (int i = 0; i < n; ++i) cp.ids[(size_t) i] = i + 1;
+            cp.gdn.resize(64, n);
+            big.checkpoints.push_back(std::move(cp));
+        }
+        check(c.park(std::move(big)), "the longer conversation parked");
+        const std::vector<int64_t> rewind{1, 2, 3, 4, 5, 6, 20};   // a strict prefix plus one new token
+        auto m = c.best(rewind, {}, true);
+        check(m.spilled && m.tokens == 4, "the checkpoint mark at or below the prompt boundary matches");
+        SavedConversation back;
+        int64_t mount = -1;
+        check(c.restore_spilled_exact(m.id, m.tokens, rewind, {}, back, &mount) &&
+              back.live.ids.size() == 10 && back.checkpoints.size() == 2,
+              "a snapshot longer than the prompt restores whole instead of being dropped");
+        check(mount == 4, "the rewind mounts at the deepest checkpoint at or below the prompt boundary");
+        check(c.spilled_entries() == 0 && on_disk() == 0, "the consumed rewind copy leaves no file");
+        // the prompt diverges past the checkpoint boundary: the checkpoint state (verified) mounts, the longer
+        // live state is not reusable - and none of that touches the fail-closed triage (a verification miss
+        // with the file's own bytes is covered by the injected-foreign-state test above)
+        SavedConversation other = image({1, 2, 3, 4, 5, 6, 7, 8, 9, 10});
+        for (int n : {4, 8}) {
+            ConversationCheckpoint cp;
+            cp.ids.assign(n, 0);
+            for (int i = 0; i < n; ++i) cp.ids[(size_t) i] = i + 1;
+            cp.gdn.resize(64, n);
+            other.checkpoints.push_back(std::move(cp));
+        }
+        check(c.park(std::move(other)), "parked again");
+        const std::vector<int64_t> diverged{1, 2, 3, 4, 9, 9};   // diverges past the 4-token checkpoint
+        auto m2 = c.best(diverged, {}, true);
+        check(m2.spilled && m2.tokens == 4, "the checkpoint boundary still matches past the divergence");
+        int64_t mount2 = -1;
+        check(c.restore_spilled_exact(m2.id, m2.tokens, diverged, {}, back, &mount2) && mount2 == 4 &&
+              back.checkpoints.size() == 2,
+              "the divergence mounts at the verified checkpoint below it");
+        // a snapshot shorter than the prompt keeps the ordinary mount (its whole live state)
+        SavedConversation short_conv = image({1, 2, 3});
+        check(c.park(std::move(short_conv)), "the shorter conversation parked");
+        const std::vector<int64_t> grown{1, 2, 3, 4};
+        auto m3 = c.best(grown, {}, true);
+        int64_t mount3 = -1;
+        check(c.restore_spilled_exact(m3.id, m3.tokens, grown, {}, back, &mount3) && mount3 == 3 &&
+              back.live.ids.size() == 3,
+              "a snapshot shorter than the prompt mounts at its live state, as before");
+    }
+    {   // the spill directory is reconciled against the manifest at park time: orphan files go, the
+        // manifest's files stay, and the directory's total bytes are observable (acceptance 9)
+        auto c = fresh();
+        check(c.park(image({1, 2, 3})), "parked");
+        const fs::path orphan = dir / "spill-999.bin";
+        { std::FILE* f = std::fopen(orphan.string().c_str(), "wb"); std::fputs("orphan", f); std::fclose(f); }
+        check(c.park(image({4, 5, 6})), "the second park runs the reconciliation");
+        check(!fs::exists(orphan), "the orphan file is reaped");
+        check(on_disk() == 2, "only the manifest's files remain");
+        check(c.dir_bytes() > 0, "the directory's total bytes are observable");
     }
     {   // fail-open: a park write that fails drops the state (the same loss as before) and leaves nothing behind
         auto c = fresh();
