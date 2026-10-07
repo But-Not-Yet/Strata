@@ -742,6 +742,36 @@ int main() {
     }
 #endif
 
+    // spill restore (conversation cache): a file saved under another identity refuses before the payload parses
+    {
+        SavedConversation back;
+        size_t n = 0;
+        SessionStatus st;
+        const SessionFileIdentity other{0x9999888877776666ull, 0x5555444433332222ull};
+        check(!session_file_read(good.string(), other, back, n, error, {}, &st) &&
+              st.error == SessionError::invalid && back.live.ids.empty(),
+              "a foreign identity is refused before the payload is parsed");
+    }
+    // spill-to-session-file phase one: a restart clears the spill directory (own files only)
+    {
+        const fs::path spill = dir / "spill-dir";
+        fs::create_directories(spill / "sub");
+        spit(spill / "spill-abc-1.bin", std::vector<char>(5, 'x'));
+        spit(spill / "spill-def-2.bin", std::vector<char>(5, 'y'));
+        spit(spill / "spill-ghi-3.bin", std::vector<char>(5, 'z'));
+        spit(spill / "keep.txt", std::vector<char>(2, 'k'));
+        spit(spill / "sub" / "spill-jkl-4.bin", std::vector<char>(5, 'w'));
+        std::string clear_error;
+        const size_t removed = conversation_spill_clear_dir(spill.string(), "spill-", clear_error);
+        check(removed == 3 && clear_error.empty(), "the restart clears the spill files of a previous run");
+        check(!fs::exists(spill / "spill-abc-1.bin") && !fs::exists(spill / "spill-def-2.bin") &&
+              !fs::exists(spill / "spill-ghi-3.bin"), "the spill files are gone");
+        check(fs::exists(spill / "keep.txt") && fs::exists(spill / "sub" / "spill-jkl-4.bin"),
+              "foreign files and subfolders are left alone");
+        check(conversation_spill_clear_dir((dir / "absent-spill").string(), "spill-", clear_error) == 0 &&
+              clear_error.empty(), "an absent spill directory is not an error");
+    }
+
     fs::remove_all(dir);
     std::printf("conversation_file_test: %d checks passed\n", checks);
     return 0;

@@ -2,7 +2,12 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <filesystem>
+#include <string>
+#include <system_error>
 #include <vector>
+
+#include "strata/core/conversation_file.hpp"
 
 using namespace strata::core;
 
@@ -324,6 +329,168 @@ int main() {
         p2.checkpoints.back().gdn.resize(64, 1);
         check(tiny.put(std::move(p2)), "a pinned one fits an empty cache");
         check(!tiny.put(image({7,8,9})) && tiny.size() == 1, "nothing else fits beside it: parking is refused, the pin stays");
+    }
+    {   // spill-to-session-file: the eviction victim is serialized to disk (format v1) instead of dropped, the
+        // RAM manifest keeps (key hash, tokens, geometry, path), best() consults it, and a hit reads the file back
+        namespace fs = std::filesystem;
+        const fs::path dir = fs::temp_directory_path() / "strata_conv_cache_spill_test";
+        fs::remove_all(dir);
+        fs::create_directories(dir);
+        double clock_now = 100.0;
+        ConversationCache::SpillHooks hooks;
+        hooks.dir = dir.string();
+        hooks.write = [](const SavedConversation& im, const std::string& path, std::string& e) {
+            const SessionFileIdentity id{11, 22};
+            size_t bytes = 0;
+            return session_file_write(path, im, id, bytes, e, {}, nullptr);
+        };
+        hooks.read = [](const std::string& path, SavedConversation& out, std::string& e) {
+            const SessionFileIdentity id{11, 22};
+            size_t bytes = 0;
+            return session_file_read(path, id, out, bytes, e, {}, nullptr);
+        };
+        hooks.remove = [](const std::string& path) { std::error_code ec; fs::remove(path, ec); return !ec; };
+        hooks.admit_write = [](size_t) { return true; };
+        const auto hooked = [&]() {
+            ConversationCache c(1 << 20, 2);
+            c.set_spill_hooks(hooks);
+            c.set_spill_clock([&] { return clock_now; });
+            c.set_spill_cooldown(120.0);
+            return c;
+        };
+
+        {   // budget-driven eviction spills the oldest entry; a manifest hit reads it back whole
+            auto c = hooked();
+            SavedConversation big = image({1, 2, 3});
+            ConversationCheckpoint cp;
+            cp.ids = {1, 2};
+            cp.gdn.resize(64, 3);
+            big.checkpoints.push_back(cp);
+            big.kv.emplace_back();
+            big.kv.back().k.resize(512);
+            const size_t one = big.bytes();
+            const size_t two = image({9, 8, 7}).bytes();
+            ConversationCache small(one + two, 8);   // exactly big + one small entry
+            small.set_spill_hooks(hooks);
+            small.set_spill_clock([&] { return clock_now; });
+            small.set_spill_cooldown(0.0);   // the hysteresis has its own block
+            check(small.put(std::move(big)) && small.put(image({9, 8, 7})), "two entries fill the budget");
+            check(small.spilled_entries() == 0, "nothing spilled yet");
+            check(small.put(image({5, 6, 7})), "a third parks by spilling the oldest");
+            check(small.evictions() == 1 && small.spills() == 1 && small.failed_spills() == 0,
+                  "the budget eviction became a spill, not a drop");
+            check(small.spilled_entries() == 1 && small.spilled_bytes() >= one, "the manifest holds the spilled entry");
+            check(small.bytes() == two * 2 && small.size() == 2, "the victim's RAM is freed and accounted");
+            const std::vector<int64_t> prompt{1, 2, 3, 4};
+            auto m = small.best(prompt, {}, true);
+            check(m.spilled && m.tokens == 3 && !m.live, "best() finds the spilled entry through the manifest");
+            check(small.best(std::vector<int64_t>{9, 8, 7, 5}, {}, true).spilled == false &&
+                  small.best(std::vector<int64_t>{9, 8, 7, 5}, {}, true).tokens == 3,
+                  "the RAM entry still wins; the non-matching prompt misses the manifest");
+            check(small.best(prompt, {}, false).tokens == 0, "steering mode isolates the manifest too");
+            SavedConversation back;
+            check(small.restore_spilled(m.index, back) && back.live.ids == std::vector<int32_t>({1, 2, 3}) &&
+                  back.checkpoints.size() == 1 && back.checkpoints[0].ids == std::vector<int32_t>({1, 2}) &&
+                  back.checkpoints[0].gdn.size() == 64 && back.kv.size() == 1 && back.kv[0].k.size() == 512,
+                  "the spilled entry reads back whole, checkpoint chain and K/V included");
+            check(small.spilled_entries() == 0 && small.spilled_restores() == 1, "the manifest entry goes on restore");
+            check(small.best(prompt, {}, true).tokens == 0, "the restored entry is the caller's active state now");
+        }
+        {   // hysteresis: the entry just hit and re-parked is never spilled inside the cooldown; later it is
+            ConversationCache c(1 << 20, 1);
+            c.set_spill_hooks(hooks);
+            c.set_spill_clock([&] { return clock_now; });
+            c.set_spill_cooldown(120.0);
+            check(c.put(image({1, 2, 3})), "A parked");
+            auto ra = c.take(c.best(a, {}, true).index);   // A is the active conversation
+            clock_now += 1.0;
+            check(c.put(std::move(ra)), "A parks again right after its turn");
+            check(!c.put(image({4, 5, 6})), "inside the cooldown the fresh hit is not spilled: the park is refused");
+            check(c.spills() == 0 && c.evictions() == 0 && c.failed_spills() == 0, "no thrash spill happened");
+            clock_now += 200.0;
+            check(c.put(image({4, 5, 6})), "past the cooldown the stale entry spills");
+            check(c.spills() == 1 && c.evictions() == 1, "the eviction after the cooldown wrote a file");
+        }
+        {   // fail-open: a failed write falls back to the current behaviour (drop), parking still succeeds
+            auto c = hooked();
+            c.set_spill_cooldown(0.0);
+            c.set_spill_hooks([&] {
+                ConversationCache::SpillHooks h2 = hooks;
+                h2.write = [](const SavedConversation&, const std::string&, std::string& e) {
+                    e = "injected failure";
+                    return false;
+                };
+                return h2;
+            }());
+            c.set_spill_clock([&] { return clock_now; });
+            const size_t one = image({1, 2, 3}).bytes();
+            check(c.put(image({1, 2, 3})) && c.put(image({7, 8, 9})), "two entries parked");
+            check(c.put(image({4, 5, 6})) && c.evictions() == 1 && c.failed_spills() == 1 && c.spills() == 0,
+                  "a failed spill still evicts (fail-open drop) and counts the failure");
+            check(!c.last_spill_error().empty(), "the spill error is reported");
+            check(c.spilled_entries() == 0, "a failed spill leaves no manifest entry");
+        }
+        {   // the RAM safety hook: a refused admission does not write to disk (the victim is dropped instead)
+            auto c = hooked();
+            c.set_spill_cooldown(0.0);
+            c.set_spill_hooks([&] {
+                ConversationCache::SpillHooks h2 = hooks;
+                h2.admit_write = [](size_t) { return false; };
+                return h2;
+            }());
+            c.set_spill_clock([&] { return clock_now; });
+            check(c.put(image({1, 2, 3})) && c.put(image({7, 8, 9})), "two entries parked");
+            check(c.put(image({4, 5, 6})) && c.evictions() == 1 && c.failed_spills() == 1 && c.spills() == 0,
+                  "a refused admission falls back to the drop");
+        }
+        {   // spill_one: the gate-refusal path frees exactly one eligible entry per call; pins and fresh entries stay
+            auto c = hooked();
+            check(c.put(image({1, 2, 3})), "A parked");
+            clock_now += 200.0;
+            check(c.put(image({7, 8, 9})), "B parked fresh");
+            check(c.spill_one(), "spill_one spills the oldest eligible entry");
+            check(c.spills() == 1 && c.evictions() == 0 && c.size() == 1 && c.spilled_entries() == 1,
+                  "spill_one frees RAM without counting an eviction");
+            check(!c.spill_one(), "the fresh entry is inside the cooldown: nothing more is spillable");
+            clock_now += 200.0;
+            check(c.spill_one(), "past the cooldown the last entry spills too");
+            check(c.size() == 0 && c.spilled_entries() == 2, "an emptied cache");
+        }
+        {   // a spilled file that no longer reads (corrupt, identity changed) is dropped, not a dead match
+            auto c = hooked();
+            check(c.put(image({1, 2, 3})) && c.put(image({7, 8, 9})), "two entries parked");
+            clock_now += 200.0;
+            check(c.put(image({4, 5, 6})) && c.spills() == 1, "the oldest spilled");
+            check(c.spilled_entries() == 1, "manifest holds one");
+            // corrupt every spill file the earlier blocks left behind (each cache numbers its own spill-1.bin, ...)
+            for (const auto& e : fs::directory_iterator(dir))
+                if (e.is_regular_file() && e.file_size() > 0) fs::resize_file(e.path(), 8);
+            SavedConversation back;
+            auto m = c.best(std::vector<int64_t>{1, 2, 3, 4}, {}, true);
+            check(m.spilled, "the manifest still matches the corrupt entry");
+            check(!c.restore_spilled(m.index, back), "the corrupt file refuses to read");
+            check(c.spilled_entries() == 0, "the unreadable entry is dropped from the manifest (fail-open)");
+        }
+        {   // superseded spilled copies leave the manifest when the same conversation parks a newer state
+            auto c = hooked();
+            SavedConversation big = image({1, 2, 3});
+            ConversationCheckpoint cp;
+            cp.ids = {1, 2};
+            big.checkpoints.push_back(cp);
+            const size_t one = big.bytes();
+            ConversationCache small(one + image({9, 8, 7}).bytes(), 8);
+            small.set_spill_hooks(hooks);
+            small.set_spill_clock([&] { return clock_now; });
+            small.set_spill_cooldown(120.0);
+            check(small.put(std::move(big)) && small.put(image({9, 8, 7})), "parked");
+            clock_now += 200.0;
+            check(small.put(image({5, 6, 7})) && small.spills() == 1, "the first copy spilled");
+            auto newer = image({1, 2, 3, 30, 31});   // the same conversation, one turn later (longer live state)
+            check(small.put(std::move(newer)) && small.spilled_entries() == 0, "the newer park supersedes the spilled copy");
+            auto bm = small.best(std::vector<int64_t>{1, 2, 3, 30, 31, 40}, {}, true);
+            check(bm.tokens == 5 && !bm.spilled, "the newer copy is in RAM and matches longer");
+        }
+        fs::remove_all(dir);
     }
     std::printf("conversation_cache_test: %d checks passed\n", checks);
 }

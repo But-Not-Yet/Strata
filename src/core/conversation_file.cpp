@@ -1253,4 +1253,20 @@ bool session_file_read(const std::string& path, const SessionFileIdentity& id, S
     return ok;
 }
 
+size_t conversation_spill_clear_dir(const std::string& dir, const char* prefix, std::string& error) {
+    error.clear();
+    const size_t plen = std::strlen(prefix);
+    size_t removed = 0;
+    std::error_code ec;
+    for (std::filesystem::directory_iterator it(dir, ec), end; !ec && it != end; it.increment(ec)) {
+        if (!it->is_regular_file(ec) || ec) continue;
+        const std::string name = it->path().filename().string();
+        if (name.size() < plen || std::memcmp(name.data(), prefix, plen) != 0) continue;
+        if (std::filesystem::remove(it->path(), ec) && !ec) ++removed;
+        else if (ec) { error = "spill: cannot remove " + it->path().string() + ": " + ec.message(); break; }
+    }
+    if (ec && error.empty() && !std::filesystem::exists(dir)) error.clear();   // absent directory: nothing to clear
+    return removed;
+}
+
 } // namespace strata::core

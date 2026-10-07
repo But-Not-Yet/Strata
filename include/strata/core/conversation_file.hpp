@@ -240,4 +240,10 @@ bool session_file_read(const std::string& path, const SessionFileIdentity& id, S
 // folder (\\server\share\dir\) and gives a drive root (C:\); empty for a bare file name (the current folder).
 std::string session_free_space_dir(const std::string& path, bool windows_rules);
 
+// Spill-to-session-file, phase one (conversation cache): a restart clears the spill directory of the previous run —
+// only regular files whose name starts with `prefix` are removed, subfolders and foreign files are left alone.  An
+// absent directory removes nothing and is not an error.  Returns how many files were removed; on a filesystem error
+// the count so far, with `error` set (the engine logs and continues).
+size_t conversation_spill_clear_dir(const std::string& dir, const char* prefix, std::string& error);
+
 } // namespace strata::core

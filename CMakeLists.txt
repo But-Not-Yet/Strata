@@ -102,7 +102,7 @@ option(STRATA_WERROR "Treat compiler warnings as errors" OFF)
 
 if(STRATA_BUILD_CONVERSATION_TESTS)
   enable_testing()
-  add_executable(conversation_cache_test src/core/conversation_cache_test.cpp)
+  add_executable(conversation_cache_test src/core/conversation_cache_test.cpp src/core/conversation_file.cpp)
   target_include_directories(conversation_cache_test PRIVATE include)
   add_test(NAME conversation_cache_test COMMAND conversation_cache_test)
   add_executable(conversation_split_failure_test src/core/conversation_split_failure_test.cpp)
