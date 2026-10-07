@@ -896,12 +896,16 @@ window and ignored, and a malformed field is a 400. One pinned prefix at a time 
 it needs `--prompt-cache 3` or more. `tools/research_run.py` runs a document and a question list against a server with and
 without it. The engine's own key is `pin=N` on the `GEN` line.
 
-**Multiple conversations (opt-in).** Add `--conversation-cache-mib 8192
---conversation-cache-slots 4` to the engine arguments to park up to four conversations
-in a bounded 8 GiB host-RAM cache. This preserves controller/worker histories when
-their requests alternate; it does not execute requests concurrently. No client session
-ID is required: only exact token/image prefixes with matching steering mode are reused.
-The default budget is 0 (disabled); `--prompt-cache 0` also disables parking.
+**Multiple conversations (opt-in, disk-authoritative).** Add `--conversation-cache-dir DIR` to
+park conversations as session files in DIR: a displaced conversation is written to disk and its
+host RAM freed (park-on-displacement); a returning one is read back. A parked conversation holds
+no RAM, so there is no byte budget and no slot count. This preserves controller/worker histories
+when their requests alternate; it does not execute requests concurrently. No client session ID is
+required: only exact token/image prefixes with matching steering mode are reused (a manifest of
+key hashes matches; the restored state is re-verified token-exactly before it is applied).
+`--prompt-cache 0` also disables parking. `--conversation-cache-mib` and
+`--conversation-cache-slots` are deprecated (a startup WARNING says so): the first now only caps
+the transient K/V retention between a restore and the next park, the second is ignored.
 With `--layer-split`, a parked conversation holds one image per stage (each later stage's
 session and its share of the conversation checkpoints), every image is validated before
 anything is overwritten, and each is restored on its own GPU. Verified on a 4-GPU split:
@@ -917,33 +921,28 @@ log), and for every setup how many prompt tokens the cache gave back - in the la
 `/metrics` has the same under `"conversation_cache"`.
 
 Snapshots contain running state, checkpoints, used K/V pages, and draft-layer K/V.
-They add host RAM, not another model or VRAM allocation. The byte budget also counts
-an incoming snapshot during a switch. After a restore, unchanged K/V pages can be
-retained for the next parking operation; growth appends storage without copying
-the existing pages. Rewinds refresh the affected pages, and running state and
-checkpoints are captured again. Retained active K/V counts against the same byte
-budget and is discarded before evicting parked entries under memory pressure.
-If reserving space for growth would evict another conversation, parking uses a
-full capture instead.
-Oldest parked entries are evicted first.
-Oversized snapshots or host allocation failures fall back to ordinary prompt processing.
-`--conversation-cache-min-free-mib N` (default 2560) additionally requires that
-physical-RAM headroom remain available: the engine checks before allocation and
-again after capture. Unknown telemetry or insufficient RAM skips parking. Windows
-uses `GlobalMemoryStatusEx`, Linux uses `MemAvailable`; these are host-level samples,
-not a reservation or enforcement of container/job memory limits. An 8 GiB budget
-is a cap, not a recommendation for every machine.
+They add host RAM, not another model or VRAM allocation. After a restore, unchanged K/V pages can be
+retained (within the deprecated `--conversation-cache-mib` cap, 0 retains nothing) for the next
+park's capture; growth appends storage without copying the existing pages. Rewinds refresh the
+affected pages, and running state and checkpoints are captured again.
+Oversized snapshots or host allocation failures fall back to ordinary prompt processing (the
+outgoing state is dropped, the same loss as before - a park never blocks a request).
+`--conversation-cache-min-free-mib N` (default 2560) still bounds the read of a parked
+conversation: a read the RAM admission refuses keeps the file (refused is not corrupt) and the
+request continues without the parked prefix. Windows uses `GlobalMemoryStatusEx`, Linux uses
+`MemAvailable`; these are host-level samples, not a reservation or enforcement of container/job
+memory limits.
 
-**Spilling to disk (opt-in).** With `--conversation-cache-dir DIR`, a parked conversation the budget (or the RAM
-gate) cannot hold is serialized into a session file in DIR instead of being dropped: the same format v1 as the
-session files below, bound to the model fingerprint and the engine configuration, validated before any use. A
-request whose prompt matches a spilled conversation reads the file back (a few seconds per GiB on a local NVMe)
-and continues from the parked prefix. The spill keeps a RAM manifest (key hashes, token counts, geometry, path);
-entries holding a pinned shared prefix and conversations hit within the last two minutes are never spilled, so
-alternating long sessions do not thrash. Every spill failure (disk full, RAM headroom refused, a file that no
-longer reads) falls back to the previous behaviour — the entry is dropped, or the parking is skipped — with a
-WARNING in the log; a spill never blocks a request. Phase one: a restart clears the spill directory, so spilled
-conversations do not survive a restart (the session files below do).
+**Park-on-displacement (the same flag).** With `--conversation-cache-dir DIR`, a displaced conversation is
+serialized into a session file in DIR and its RAM freed: the same format v1 as the session files below, bound to
+the model fingerprint and the engine configuration, validated before any use. The park happens BEFORE the
+incoming conversation is read, so two live K/V states are never held at once. A request whose prompt matches a
+parked conversation reads the file back (a few seconds per GiB on a local NVMe), re-verifies the matched prefix
+token-exactly, and continues from the parked prefix. The cache keeps a RAM manifest (key hashes, token counts,
+geometry, path) and nothing else; while a conversation stays active, nothing is written or read. A park write
+that fails (disk full) drops the outgoing state - the same loss as before - with a WARNING; a read that fails is
+triaged: the RAM admission's refusal keeps the file, corruption or a foreign identity deletes it. A restart
+clears the directory, so parked conversations do not survive a restart (the session files below do).
 
 The shared snapshot core validates all layers and checkpoints before applying any
 state. Invalid entries are discarded; transfer/synchronization failure is fatal
