@@ -934,6 +934,17 @@ uses `GlobalMemoryStatusEx`, Linux uses `MemAvailable`; these are host-level sam
 not a reservation or enforcement of container/job memory limits. An 8 GiB budget
 is a cap, not a recommendation for every machine.
 
+**Spilling to disk (opt-in).** With `--conversation-cache-dir DIR`, a parked conversation the budget (or the RAM
+gate) cannot hold is serialized into a session file in DIR instead of being dropped: the same format v1 as the
+session files below, bound to the model fingerprint and the engine configuration, validated before any use. A
+request whose prompt matches a spilled conversation reads the file back (a few seconds per GiB on a local NVMe)
+and continues from the parked prefix. The spill keeps a RAM manifest (key hashes, token counts, geometry, path);
+entries holding a pinned shared prefix and conversations hit within the last two minutes are never spilled, so
+alternating long sessions do not thrash. Every spill failure (disk full, RAM headroom refused, a file that no
+longer reads) falls back to the previous behaviour — the entry is dropped, or the parking is skipped — with a
+WARNING in the log; a spill never blocks a request. Phase one: a restart clears the spill directory, so spilled
+conversations do not survive a restart (the session files below do).
+
 The shared snapshot core validates all layers and checkpoints before applying any
 state. Invalid entries are discarded; transfer/synchronization failure is fatal
 rather than permission to continue with partial state. Indexer spare keys and the
