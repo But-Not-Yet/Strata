@@ -105,6 +105,12 @@ public:
         for (const auto& s : segments_) if (s.key == key) return s.refs;
         return 0;
     }
+    // Pure manifest read: is a segment with this key recorded (the park wiring's dedup precheck - a cut already
+    // on disk is skipped before its K/V would be copied).  No file is read, nothing is touched.
+    bool holds(uint64_t key) const {
+        for (const auto& s : segments_) if (s.key == key) return true;
+        return false;
+    }
     const std::string& last_error() const { return last_error_; }
 
     // The manifest match: the deepest recorded segment key that the prompt's digests reproduce.  Pure

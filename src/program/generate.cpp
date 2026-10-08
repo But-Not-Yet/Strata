@@ -22,6 +22,7 @@
 #include "strata/core/expert_cache.hpp"
 #include "strata/core/conversation_snapshot.hpp"
 #include "strata/core/conversation_file.hpp"
+#include "strata/core/conversation_segment_build.hpp"
 #include "strata/core/conversation_memory.hpp"
 #include "strata/core/coupled_draft.hpp"
 #include "strata/core/expert_source.hpp"
@@ -592,6 +593,15 @@ struct Options {
     /// --conversation-cache-dir: spill the parked conversations the budget cannot hold to session files here
     /// (phase one: a restart clears the directory; the cache does not survive a restart yet)
     std::string conversation_cache_dir;
+    /// --conversation-segment-cache: also park the stable prefix SEGMENTS of a displaced conversation into a
+    /// segment directory (R4 §4.5 阶段 A), so a returning prompt mounts the deepest whole segment instead of
+    /// reading the whole file back; the whole-file tier stays beside it as the fallback.  Default off.
+    bool conversation_segment_cache = false;
+    /// --conversation-segment-dir: the segment cache's own directory (default: <conversation-cache-dir>/segments;
+    /// the two tiers never read or write each other's files)
+    std::string conversation_segment_dir;
+    /// --conversation-segment-budget-mib: the segment directory's byte cap (refs==0, oldest last_hit first)
+    int64_t conversation_segment_budget_mib = 8192;
     /// --serve SAVE: disk space a session file must leave free where it is written (MiB; 0 = no check)
     int64_t session_min_free_mib = 4096;
     /// --serve: also keep a checkpoint every N freshly read prompt tokens (0 = only at the last turn boundary)
@@ -736,6 +746,14 @@ void usage() {
                  "  --conversation-cache-slots N  --serve: at most N parked conversations (default 4)\n"
                  "  --conversation-cache-min-free-mib N  --serve: physical RAM floor when parking or restoring a\n"
                  "                       session file (default 2560)\n"
+                 "  --conversation-segment-cache  --serve (R4 阶段 A, opt-in): also park a displaced conversation's\n"
+                 "                       stable prefix segments in their own directory; a returning prompt mounts\n"
+                 "                       the deepest whole segment (the fork tail is all it re-reads) instead of the\n"
+                 "                       whole file; the whole-file tier stays as the fallback (default off)\n"
+                 "  --conversation-segment-dir PATH  --serve: the segment directory (default: the conversation\n"
+                 "                       cache dir's \"segments\" subfolder; a restart clears it)\n"
+                 "  --conversation-segment-budget-mib N  --serve: the segment directory's byte cap, evicted\n"
+                 "                       refs==0 oldest-hit first (default 8192)\n"
                  "  --session-min-free-mib N  --serve: disk space a SAVE must leave free (default 4096; 0 = no check)\n"
                  "  --vram-elastic       --serve (#533, opt-in, NVIDIA): the expert cache in segments (--vram-segment-mib,\n"
                  "                       default 512), so the command `VRAM <reserve_mib>` (the server's POST /v1/vram) can\n"
@@ -1771,6 +1789,15 @@ int main(int argc, char** argv) {
             else { o.conversation_cache_slots = (int) number; o.conversation_cache_slots_set = true; }
         }
         else if (a == "--conversation-cache-dir") o.conversation_cache_dir = next("--conversation-cache-dir");
+        else if (a == "--conversation-segment-cache") o.conversation_segment_cache = true;
+        else if (a == "--conversation-segment-dir") o.conversation_segment_dir = next("--conversation-segment-dir");
+        else if (a == "--conversation-segment-budget-mib") {
+            o.conversation_segment_budget_mib = std::atoll(next("--conversation-segment-budget-mib"));
+            if (o.conversation_segment_budget_mib < 0) {   // a byte cap: 0 would mean unbounded - refuse, not silent
+                std::fprintf(stderr, "strata: --conversation-segment-budget-mib must be >= 0\n");
+                return 1;
+            }
+        }
         else if (a == "--prompt-cache-tail") o.prompt_cache_tail = true;
         else if (a == "--prompt-cache-every") o.prompt_cache_every = std::max(0LL, std::atoll(next("--prompt-cache-every")));
         else if (a == "--prompt-cache-root") o.prompt_cache_root = std::max(0LL, std::atoll(next("--prompt-cache-root")));
@@ -1915,6 +1942,11 @@ int main(int argc, char** argv) {
                              "caps the transient K/V retention and --conversation-cache-slots is ignored\n");
     if (o.serve && o.prompt_cache == 0 && !o.conversation_cache_dir.empty())
         std::fprintf(stderr, "strata serve: warning: conversation caching is disabled by --prompt-cache 0\n");
+    if (o.serve && o.conversation_segment_cache && o.conversation_cache_dir.empty() &&
+        o.conversation_segment_dir.empty())
+        std::fprintf(stderr, "strata serve: warning: --conversation-segment-cache without a segment directory "
+                             "(set --conversation-cache-dir or --conversation-segment-dir): the segment cache "
+                             "stays off; the whole-file tier is the only path\n");
     // parking with --layer-split saves every stage (SavedConversation::stage_images)
     // Layer split (multi-GPU): the later stages run layers [K_i, K_i+1) on their own GPUs (--split-device, default
     // the next visible ones); "auto" places the K from each GPU's free VRAM once the weights are in (below).  KV
@@ -6853,6 +6885,10 @@ int main(int argc, char** argv) {
         strata::core::ConversationCache conversations(
             o.prompt_cache > 0 && !o.conversation_cache_dir.empty(),
             o.prompt_cache > 0 ? (size_t) o.conversation_cache_mib * 1024 * 1024 : 0);
+        // The segment tier (R4 §4.5 阶段 A, opt-in): its own directory beside the spill tier's - the two never
+        // read or write each other's files.  Built disabled here; the hooks (identity, RAM floor) are wired where
+        // the spill hooks are, once the session and the model identity exist.
+        strata::core::ConversationSegmentCache conv_segments(false, 0, {});
         // Disk sessions: what a session file is bound to.  The model fingerprint samples every model input this
         // engine loaded, by role (conversation_file.hpp), once; the config fingerprint covers the RESOLVED settings
         // that change what the saved bytes mean - the rope (K is cached post-RoPE), the loaded control vector, the
@@ -7012,6 +7048,72 @@ int main(int argc, char** argv) {
             conversations.set_spill_hooks(std::move(hooks));
             }
         }
+        // The segment tier's own directory and hooks (R4 阶段 A): the same file format, identity and RAM floor
+        // the spill tier uses, under a different directory and name prefix - the two never touch each other's
+        // files (7b00dd5's coexistence promise).  A restart clears the directory: the manifest is RAM-only, an
+        // orphaned file must not accumulate.
+        {
+            std::string seg_dir = o.conversation_segment_dir;
+            if (seg_dir.empty() && !o.conversation_cache_dir.empty())
+                seg_dir = o.conversation_cache_dir + "/segments";
+            if (o.conversation_segment_cache && !seg_dir.empty()) {
+                std::error_code seg_fs_ec;
+                std::filesystem::create_directories(seg_dir, seg_fs_ec);
+                if (seg_fs_ec) {
+                    std::fprintf(stderr, "strata serve: conversation segment cache: WARNING: cannot create %s (%s); "
+                                 "the segment tier stays off and restores fall back to the whole-file tier\n",
+                                 seg_dir.c_str(), seg_fs_ec.message().c_str());
+                } else {
+                    std::string seg_clear_error;
+                    const size_t seg_cleared = strata::core::conversation_spill_clear_dir(seg_dir, "seg-", seg_clear_error);
+                    std::fprintf(stderr, "strata serve: conversation segment cache: directory %s (budget %lld MiB); "
+                                 "cleared %zu segment file(s) from a previous run%s\n",
+                                 seg_dir.c_str(), (long long) o.conversation_segment_budget_mib, seg_cleared,
+                                 seg_clear_error.empty() ? "" : (std::string(" (WARNING: ") + seg_clear_error + ")").c_str());
+                    strata::core::ConversationSegmentCache::Hooks seg_hooks;
+                    seg_hooks.dir = seg_dir;
+                    seg_hooks.write = [&](const strata::core::SavedConversation& image, const std::string& path,
+                                          std::string& e) {
+                        strata::core::SessionFileIdentity id;
+                        if (!session_identity(id, e, {})) return false;
+                        strata::core::SessionWriteOptions wo;
+                        wo.min_free_bytes = image.bytes() + kParkWriteMarginBytes;
+                        size_t bytes = 0;
+                        return strata::core::session_file_write(path, image, id, bytes, e, wo, nullptr);
+                    };
+                    seg_hooks.read = [&](const std::string& path, strata::core::SavedConversation& out,
+                                         std::string& e) {
+                        strata::core::SessionFileIdentity id;
+                        if (!session_identity(id, e, {})) return false;
+                        strata::core::SessionReadLimits limits;
+                        std::string limits_error;
+                        if (!strata::core::conversation_session_read_limits(limits, ss, g, mtp.kv_state(),
+                                (uint64_t) o.max_context, (uint64_t) std::max(o.prompt_cache, 1), limits_error)) {
+                            e = limits_error;
+                            return false;
+                        }
+                        const uint64_t floor = (uint64_t) o.conversation_cache_min_free_mib * 1024 * 1024;
+                        limits.admit = [floor, &o](uint64_t need, std::string& why) {
+                            const auto avail = strata::core::conversation_available_memory();
+                            if (strata::core::conversation_memory_admit(avail, need, floor)) return true;
+                            why = "not enough RAM to read the segment (" + std::to_string(need >> 20) +
+                                  " MiB plus a floor of " + std::to_string((long long) o.conversation_cache_min_free_mib) +
+                                  " MiB needed)";
+                            return false;
+                        };
+                        size_t bytes = 0;
+                        strata::core::SessionStatus st;
+                        return strata::core::session_file_read(path, id, out, bytes, e, limits, &st);
+                    };
+                    seg_hooks.remove = [](const std::string& path) {
+                        std::error_code rm_ec;
+                        return std::filesystem::remove(path, rm_ec) && !rm_ec;
+                    };
+                    conv_segments = strata::core::ConversationSegmentCache(
+                        true, (size_t) o.conversation_segment_budget_mib << 20, std::move(seg_hooks));
+                }
+            }
+        }
         // Save only on a switch/rewind, not on each continuing request. No graph
         // addresses change: all parked images live in ordinary host vectors.
         // Park on displacement (disk-authoritative): the outgoing conversation is captured and written straight
@@ -7107,6 +7209,18 @@ int main(int argc, char** argv) {
                     image.stage_images.push_back(std::move(part));
                 }
                 const size_t snapshot_bytes = image.bytes();
+                // R4 阶段 A: the stable segments go to their own tier BEFORE the whole file is written (the image
+                // is intact for both).  Zero work while the segment cache is off; a failed segment write is
+                // fail-open and never blocks the whole-file park.
+                strata::core::SegmentParkStats seg_stats;
+                const auto t_seg = Clock::now();
+                if (n_st == 0) seg_stats = strata::core::conversation_segment_park(conv_segments, image);
+                if (seg_stats.admitted || seg_stats.deduped || seg_stats.failed)
+                    std::fprintf(stderr, "strata serve: conversation segment cache: parked %zu segment(s) "
+                                 "(%zu already on disk, %zu failed) in %.1f ms; entries=%zu dir_bytes=%zu\n",
+                                 seg_stats.admitted, seg_stats.deduped, seg_stats.failed,
+                                 std::chrono::duration<double, std::milli>(Clock::now() - t_seg).count(),
+                                 conv_segments.entries(), conv_segments.dir_bytes());
                 const bool parked = conversations.park(std::move(image));   // the write frees the RAM (fail-open: a drop)
                 if (parked) {
                     std::fprintf(stderr, "strata serve: conversation cache: parked %zu tokens to disk in %.1f ms; "
@@ -9059,7 +9173,16 @@ int main(int argc, char** argv) {
                         }
                 }
             const auto parked = conversations.best(ids, req_imgs, want_cvec);
-            const bool will_restore = parked.tokens > std::max(resume, slot_tokens);
+            // R4 阶段 A: the segment tier's match competes with the whole file's; the deeper (or equal) one wins,
+            // the segment first (a segment mount copies one prefix, never the whole file).  A whole-file record
+            // the park just superseded can dangle (restore-by-id handles it); segment records are never
+            // superseded by a park - a mount survives it.
+            strata::core::ConversationSegmentCache::Match seg_parked;
+            if (conv_segments.enabled()) seg_parked = conv_segments.best(ids, req_imgs, want_cvec);
+            const bool seg_usable = seg_parked.found && seg_parked.tokens > std::max(resume, slot_tokens) &&
+                                    seg_parked.tokens >= parked.tokens;
+            const bool will_restore = (seg_usable ? seg_parked.tokens : parked.tokens) >
+                                      std::max(resume, slot_tokens);
             // Preserve the outgoing branch before any checkpoint rewind, reset,
             // or incoming restore overwrites the positional state it requires.
             // pin=N: this request resumes exactly at the pinned shared prefix of the conversation the session holds
@@ -9079,7 +9202,32 @@ int main(int argc, char** argv) {
             }
             std::optional<strata::core::SavedConversation> incoming;
             int64_t mount_tokens = 0;   // what the restored state may be mounted at (a rewind mounts lower)
+            bool incoming_from_live = false;   // a segment's live state IS its mount point (the whole file's is not)
             if (will_restore) {
+                bool mounted_segment = false;
+                if (seg_usable) {
+                    // R4 阶段 A, the segment path first: read the segment file back, verify its tokens against
+                    // this prompt token-exactly (the strategy layer's B-F3 gate), and hand the image to the same
+                    // validate/restore path a whole file takes.  Any failure falls through to the whole-file
+                    // tier unchanged - the fallback keeps its existing behaviour word for word.
+                    const auto t_seg_read = Clock::now();
+                    strata::core::SavedConversation from_seg;
+                    int64_t seg_mount = 0;
+                    if (conv_segments.mount(seg_parked.key, seg_parked.tokens, ids, req_imgs, from_seg, &seg_mount)) {
+                        std::fprintf(stderr, "strata serve: conversation segment cache: restored from segment "
+                                     "(%lld tokens, %.1f ms)\n", (long long) seg_mount,
+                                     std::chrono::duration<double, std::milli>(Clock::now() - t_seg_read).count());
+                        incoming.emplace(std::move(from_seg));
+                        mount_tokens = seg_mount;
+                        incoming_from_live = true;
+                        mounted_segment = true;
+                    } else {
+                        std::fprintf(stderr, "strata serve: conversation segment cache: WARNING: the segment does "
+                                     "not mount (%s); falling back to the whole-file tier\n",
+                                     conv_segments.last_error().c_str());
+                    }
+                }
+                if (!mounted_segment && parked.tokens > std::max(resume, slot_tokens)) {
                 // the match lives in a session file: read it back, re-verify the matched prefix token-exactly
                 // (B-F3), and triage the failures - an admission refusal keeps the file (refused is not corrupt,
                 // B-F2); corruption, a foreign identity or a verification miss deletes it; either way the request
@@ -9103,6 +9251,7 @@ int main(int argc, char** argv) {
                     std::fprintf(stderr, "strata serve: conversation cache: WARNING: the parked conversation does "
                                  "not restore (corrupt or a verification miss: %s); its file is dropped and the "
                                  "request continues without the parked prefix\n", conversations.last_error().c_str());
+                }
                 }
             }
             if (incoming) slot_source = -1;
@@ -9221,7 +9370,7 @@ int main(int argc, char** argv) {
                 // prompt is a strict prefix of it (a rewind), the deepest checkpoint at or below the prompt's
                 // boundary (mounted through that checkpoint's own saved running state further below)
                 resume = mount_tokens;
-                from_live = parked.live;
+                from_live = incoming_from_live;
                 if (std::getenv("STRATA_SNAPSHOT_FULL_CAPTURE") == nullptr) {
                     std::vector<std::vector<strata::core::ConversationKv>> stage_kv;   // every stage's, for its next park
                     for (auto& si : incoming->stage_images) stage_kv.push_back(std::move(si.kv));
