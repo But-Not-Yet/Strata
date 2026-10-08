@@ -1253,7 +1253,8 @@ bool session_file_read(const std::string& path, const SessionFileIdentity& id, S
     return ok;
 }
 
-size_t conversation_spill_clear_dir(const std::string& dir, const char* prefix, std::string& error) {
+size_t conversation_spill_clear_dir_except(const std::string& dir, const char* prefix,
+                                           const std::vector<std::string>& keep, std::string& error) {
     error.clear();
     const size_t plen = std::strlen(prefix);
     size_t removed = 0;
@@ -1264,18 +1265,92 @@ size_t conversation_spill_clear_dir(const std::string& dir, const char* prefix, 
         // Our own files: `spill-N.bin`, and the temporary orphan a crashed write left behind -
         // `.<prefix><leaf>.<hex>.tmp` (temp_name below); anything else belongs to someone else.
         bool ours = name.size() >= plen && std::memcmp(name.data(), prefix, plen) == 0;
+        bool temporary = false;
         if (!ours && name.size() > plen + 5 && name[0] == '.' &&
             std::memcmp(name.data() + 1, prefix, plen) == 0 &&
             std::memcmp(name.data() + name.size() - 4, ".tmp", 4) == 0) {
             const std::string middle = name.substr(plen + 1, name.size() - plen - 5);
-            ours = !middle.empty() && middle.find('.') != std::string::npos;   // a leaf part and a hex part
+            temporary = !middle.empty() && middle.find('.') != std::string::npos;   // a leaf part and a hex part
+            ours = temporary;
         }
         if (!ours) continue;
+        if (!temporary && !keep.empty()) {
+            bool kept = false;
+            for (const auto& k : keep) if (k == name) { kept = true; break; }
+            if (kept) continue;   // the persisted manifest still names this file: it survives the restart
+        }
         if (std::filesystem::remove(it->path(), ec) && !ec) ++removed;
         else if (ec) { error = "spill: cannot remove " + it->path().string() + ": " + ec.message(); break; }
     }
     if (ec && error.empty() && !std::filesystem::exists(dir)) error.clear();   // absent directory: nothing to clear
     return removed;
+}
+
+size_t conversation_spill_clear_dir(const std::string& dir, const char* prefix, std::string& error) {
+    return conversation_spill_clear_dir_except(dir, prefix, {}, error);
+}
+
+// The manifest blob: written to a temporary beside the destination and renamed over, so a reader sees the old
+// complete file or the new complete file, never a half write.  Small (tens of KiB), so no streaming concerns.
+bool conversation_manifest_write(const std::string& path, const std::vector<uint8_t>& blob, std::string& error) {
+    error.clear();
+    std::string dir, leaf;
+    if (!split_path(path, dir, leaf, error)) return false;
+    const std::string temp = (dir.empty() ? std::string() : dir + "/") + temp_name(leaf);
+#ifdef _WIN32
+    std::wstring wtemp, wfinal;
+    if (!wide(temp, wtemp) || !wide(path, wfinal)) { error = "manifest: the path is not valid UTF-8"; return false; }
+    {
+        HANDLE h = CreateFileW(wtemp.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (h == INVALID_HANDLE_VALUE) { error = "manifest: cannot create " + temp; return false; }
+        DWORD written = 0;
+        const bool ok = blob.empty() ||
+                        (WriteFile(h, blob.data(), (DWORD) blob.size(), &written, nullptr) && written == blob.size());
+        FlushFileBuffers(h);
+        CloseHandle(h);
+        if (!ok) { DeleteFileW(wtemp.c_str()); error = "manifest: cannot write " + temp; return false; }
+    }
+    if (!MoveFileExW(wtemp.c_str(), wfinal.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+        DeleteFileW(wtemp.c_str());
+        error = "manifest: cannot publish " + path;
+        return false;
+    }
+    return true;
+#else
+    {
+        std::FILE* f = std::fopen(temp.c_str(), "wb");
+        if (!f) { error = "manifest: cannot create " + temp; return false; }
+        const bool ok = blob.empty() || std::fwrite(blob.data(), 1, blob.size(), f) == blob.size();
+        if (std::fclose(f) != 0 || !ok) {
+            std::remove(temp.c_str());
+            error = "manifest: cannot write " + temp;
+            return false;
+        }
+    }
+    if (std::rename(temp.c_str(), path.c_str()) != 0) {
+        std::remove(temp.c_str());
+        error = "manifest: cannot publish " + path + ": " + std::strerror(errno);
+        return false;
+    }
+    return true;
+#endif
+}
+
+bool conversation_manifest_read(const std::string& path, std::vector<uint8_t>& blob, std::string& error) {
+    error.clear();
+    blob.clear();
+    std::error_code ec;
+    const auto size = std::filesystem::file_size(path, ec);
+    if (ec) { error = "no manifest at " + path; return false; }
+    constexpr uint64_t kManifestMaxBytes = 16ull << 20;   // the manifest is tens of KiB; refuse nonsense loud
+    if (size > kManifestMaxBytes) { error = "manifest larger than 16 MiB at " + path; return false; }
+    std::FILE* f = std::fopen(path.c_str(), "rb");
+    if (!f) { error = "cannot open " + path; return false; }
+    blob.resize((size_t) size);
+    const bool ok = size == 0 || std::fread(blob.data(), 1, blob.size(), f) == blob.size();
+    const bool closed = std::fclose(f) == 0;
+    if (!ok || !closed) { blob.clear(); error = "cannot read " + path; return false; }
+    return true;
 }
 
 } // namespace strata::core

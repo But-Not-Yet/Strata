@@ -939,10 +939,11 @@ the model fingerprint and the engine configuration, validated before any use. Th
 incoming conversation is read, so two live K/V states are never held at once. A request whose prompt matches a
 parked conversation reads the file back (a few seconds per GiB on a local NVMe), re-verifies the matched prefix
 token-exactly, and continues from the parked prefix. The cache keeps a RAM manifest (key hashes, token counts,
-geometry, path) and nothing else; while a conversation stays active, nothing is written or read. A park write
-that fails (disk full) drops the outgoing state - the same loss as before - with a WARNING; a read that fails is
-triaged: the RAM admission's refusal keeps the file, corruption or a foreign identity deletes it. A restart
-clears the directory, so parked conversations do not survive a restart (the session files below do).
+geometry, path); it is written beside the parked files and adopted by the next start (the restart-survival
+patch), so the parked conversations survive a restart. While a conversation stays active, nothing is written
+or read. A park write that fails (disk full) drops the outgoing state - the same loss as before - with a
+WARNING; a read that fails is triaged: the RAM admission's refusal keeps the file, corruption or a foreign
+identity deletes it.
 
 The shared snapshot core validates all layers and checkpoints before applying any
 state. Invalid entries are discarded; transfer/synchronization failure is fatal
@@ -950,8 +951,8 @@ rather than permission to continue with partial state. Indexer spare keys and th
 moving spare row are preserved, including checkpoint rewinds.
 The engine log reports parking, restoration, bytes, evictions, individual snapshot
 sizes and K/V bytes reused during capture. `STRATA_SNAPSHOT_FULL_CAPTURE=1` disables
-retention for diagnostic comparisons. Parked snapshots are not
-persisted across restarts; the session files below are.
+retention for diagnostic comparisons. Parked snapshots are persisted across
+restarts (the manifest is dumped beside them and adopted at the next start); the session files below are.
 
 **Session files (disk).** The conversation the engine holds can be saved to a file and restored later, also after a
 restart of the same engine version, so a long prompt is not read again. The server exposes the save and restore

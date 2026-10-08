@@ -267,6 +267,95 @@ public:
         return evicted;
     }
 
+    // ---- manifest persistence: survive a restart (the restart-survival patch) ------------------------
+    // The segment tier's analogue of the spill tier's dump/adopt: the manifest is written beside the segment
+    // files and adopted at the next start, so a segment the previous run parked can still mount (its file,
+    // identity and token verification all unchanged - only the RAM index crosses the restart).  Fail-open:
+    // a missing, unreadable or malformed dump is "no manifest" to the caller, and a record whose file is not
+    // in `present` (file names) is dropped at adoption.
+    std::vector<uint8_t> dump_manifest() const {
+        ConversationManifestWriter w;
+        static const char kMagic[8] = {'S', 'T', 'C', 'M', 'A', 'N', 'G', '1'};
+        w.blob(kMagic, 8);
+        w.u32(1);   // version
+        w.u32(0);   // reserved
+        w.u64(last_hit_seq_);
+        w.u64(segments_.size());
+        for (const auto& s : segments_) {
+            w.u64(s.key);
+            w.i64(s.tokens);
+            w.u64(s.bytes);
+            w.u64(s.last_hit);
+            w.u8(s.cvec ? 1 : 0);
+            for (int k = 0; k < 7; ++k) w.u8(0);   // pad to 8
+            const std::string leaf = conversation_manifest_leaf(s.path);
+            w.u64(leaf.size());
+            w.blob(leaf.data(), leaf.size());
+        }
+        w.u64(conversation_manifest_checksum(w.bytes.data(), w.bytes.size()));
+        return std::move(w.bytes);
+    }
+    bool adopt_manifest(const std::vector<uint8_t>& blob, const std::vector<std::string>& present,
+                        std::string& error) {
+        ConversationManifestReader r{blob.data(), blob.size()};
+        const uint8_t* m = r.take(8);
+        if (!m || std::string(reinterpret_cast<const char*>(m), 8) != "STCMANG1") {
+            error = "not a segment manifest"; return false;
+        }
+        if (r.u32() != 1) { error = "unsupported segment manifest version"; return false; }
+        (void) r.u32();
+        const uint64_t aux = r.u64();
+        const uint64_t count = r.u64();
+        if (!r.ok || count > 65536) { error = "malformed segment manifest header"; return false; }
+        std::deque<Segment> records;
+        for (uint64_t i = 0; i < count; ++i) {
+            Segment s;
+            s.key = r.u64();
+            s.tokens = r.i64();
+            s.bytes = (size_t) r.u64();
+            s.last_hit = r.u64();
+            s.cvec = r.u8() != 0;
+            for (int k = 0; k < 7; ++k) (void) r.u8();
+            const uint64_t path_len = r.u64();
+            if (!r.ok || path_len == 0 || path_len > 4096) { error = "malformed segment record"; return false; }
+            const uint8_t* p = r.take((size_t) path_len);
+            if (!p) { error = "malformed segment record"; return false; }
+            const std::string leaf(reinterpret_cast<const char*>(p), (size_t) path_len);
+            if (leaf.find('/') != std::string::npos || leaf.find('\\') != std::string::npos) {
+                error = "malformed segment path"; return false;
+            }
+            s.path = hooks_.dir.empty() ? leaf : hooks_.dir + "/" + leaf;
+            s.refs = 0;   // pins do not survive a restart (no live session exists yet)
+            records.push_back(std::move(s));
+        }
+        const uint64_t sum = r.u64();
+        if (!r.ok || r.off != blob.size()) { error = "malformed segment manifest tail"; return false; }
+        if (conversation_manifest_checksum(blob.data(), blob.size() - 8) != sum) {
+            error = "segment manifest checksum mismatch"; return false;
+        }
+        std::deque<Segment> kept;
+        for (auto& s : records) {
+            bool here = false;
+            for (const auto& p : present)
+                if (p == conversation_manifest_leaf(s.path)) { here = true; break; }
+            if (here) kept.push_back(std::move(s));
+        }
+        uint64_t max_hit = aux;
+        size_t bytes = 0;
+        for (const auto& s : kept) { max_hit = std::max(max_hit, s.last_hit); bytes += s.bytes; }
+        segments_ = std::move(kept);
+        last_hit_seq_ = std::max(last_hit_seq_, max_hit);
+        dir_bytes_ = bytes;   // the records' payload accounting; the disk's exact bytes settle at the next pass
+        return true;
+    }
+    // The parked files' names, for the startup keep-list of the directory clear (mirrors the spill tier's).
+    std::vector<std::string> segment_files() const {
+        std::vector<std::string> v;
+        v.reserve(segments_.size());
+        for (const auto& s : segments_) v.push_back(conversation_manifest_leaf(s.path));
+        return v;
+    }
+
 private:
     void drop(size_t index) {
         if (hooks_.remove) hooks_.remove(segments_[index].path);

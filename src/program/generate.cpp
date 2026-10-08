@@ -591,8 +591,11 @@ struct Options {
     bool conversation_cache_mib_set = false, conversation_cache_slots_set = false;
     int64_t conversation_cache_min_free_mib = 2560;
     /// --conversation-cache-dir: spill the parked conversations the budget cannot hold to session files here
-    /// (phase one: a restart clears the directory; the cache does not survive a restart yet)
+    /// (the restart-survival patch keeps them across a restart: the persisted manifest is adopted at start)
     std::string conversation_cache_dir;
+    /// --no-conversation-cache-persist: disable the manifest persistence (default on).  Off = the phase-one
+    /// behaviour: the spill and segment directories are cleared at startup and nothing survives a restart.
+    bool conversation_cache_persist = true;
     /// --conversation-segment-cache: also park the stable prefix SEGMENTS of a displaced conversation into a
     /// segment directory (R4 §4.5 阶段 A), so a returning prompt mounts the deepest whole segment instead of
     /// reading the whole file back; the whole-file tier stays beside it as the fallback.  Default off.
@@ -746,12 +749,14 @@ void usage() {
                  "  --conversation-cache-slots N  --serve: at most N parked conversations (default 4)\n"
                  "  --conversation-cache-min-free-mib N  --serve: physical RAM floor when parking or restoring a\n"
                  "                       session file (default 2560)\n"
+                 "  --no-conversation-cache-persist  --serve: disable keeping the parked conversations across a\n"
+                 "                       restart (default: the manifest persists; off = the phase-one clear)\n"
                  "  --conversation-segment-cache  --serve (R4 阶段 A, opt-in): also park a displaced conversation's\n"
                  "                       stable prefix segments in their own directory; a returning prompt mounts\n"
                  "                       the deepest whole segment (the fork tail is all it re-reads) instead of the\n"
                  "                       whole file; the whole-file tier stays as the fallback (default off)\n"
                  "  --conversation-segment-dir PATH  --serve: the segment directory (default: the conversation\n"
-                 "                       cache dir's \"segments\" subfolder; a restart clears it)\n"
+                 "                       cache dir's \"segments\" subfolder; kept across restarts by default)\n"
                  "  --conversation-segment-budget-mib N  --serve: the segment directory's byte cap, evicted\n"
                  "                       refs==0 oldest-hit first (default 8192)\n"
                  "  --session-min-free-mib N  --serve: disk space a SAVE must leave free (default 4096; 0 = no check)\n"
@@ -1789,6 +1794,7 @@ int main(int argc, char** argv) {
             else { o.conversation_cache_slots = (int) number; o.conversation_cache_slots_set = true; }
         }
         else if (a == "--conversation-cache-dir") o.conversation_cache_dir = next("--conversation-cache-dir");
+        else if (a == "--no-conversation-cache-persist") o.conversation_cache_persist = false;
         else if (a == "--conversation-segment-cache") o.conversation_segment_cache = true;
         else if (a == "--conversation-segment-dir") o.conversation_segment_dir = next("--conversation-segment-dir");
         else if (a == "--conversation-segment-budget-mib") {
@@ -6975,11 +6981,7 @@ int main(int argc, char** argv) {
                                      "is disabled and displaced conversations are dropped\n",
                              o.conversation_cache_dir.c_str(), fs_ec.message().c_str());
             } else {
-            std::string clear_error;
-            const size_t cleared = strata::core::conversation_spill_clear_dir(o.conversation_cache_dir, "spill-", clear_error);
-            std::fprintf(stderr, "strata serve: conversation cache: spill directory %s; cleared %zu spill file(s) from a previous run%s\n",
-                         o.conversation_cache_dir.c_str(), cleared,
-                         clear_error.empty() ? "" : (std::string(" (WARNING: ") + clear_error + ")").c_str());
+            // The directory clear runs after the manifest is adopted (below), so the files it names survive.
             strata::core::ConversationCache::SpillHooks hooks;
             hooks.dir = o.conversation_cache_dir;
             hooks.write = [&](const strata::core::SavedConversation& image, const std::string& path, std::string& e) {
@@ -7046,6 +7048,37 @@ int main(int argc, char** argv) {
                 return removed;
             };
             conversations.set_spill_hooks(std::move(hooks));
+            // The restart-survival patch: adopt the persisted manifest BEFORE the directory clear, keep the
+            // files it names, and clear the rest (orphans and .tmp).  Fail-open: without a readable manifest
+            // this is exactly the phase-one clear.
+            {
+                const std::string manifest_path = o.conversation_cache_dir + "/parked-manifest-v1.bin";
+                std::vector<std::string> present;
+                std::error_code pec;
+                for (std::filesystem::directory_iterator it(o.conversation_cache_dir, pec), end; !pec && it != end; it.increment(pec)) {
+                    if (!it->is_regular_file(pec) || pec) continue;
+                    const std::string name = it->path().filename().string();
+                    if (name.rfind("spill-", 0) == 0 && name.size() > 4 && name.compare(name.size() - 4, 4, ".bin") == 0)
+                        present.push_back(name);
+                }
+                std::vector<uint8_t> blob;
+                std::string merr, aerr;
+                bool adopted = false;
+                if (o.conversation_cache_persist && strata::core::conversation_manifest_read(manifest_path, blob, merr)) {
+                    adopted = conversations.adopt_manifest(blob, present, aerr);
+                    if (!adopted)
+                        std::fprintf(stderr, "strata serve: conversation cache: WARNING: the parked manifest does not "
+                                             "read (%s); clearing the directory as before\n", aerr.c_str());
+                }
+                std::string clear_error;
+                const size_t removed = strata::core::conversation_spill_clear_dir_except(
+                    o.conversation_cache_dir, "spill-",
+                    adopted ? conversations.spilled_files() : std::vector<std::string>{}, clear_error);
+                std::fprintf(stderr, "strata serve: conversation cache: spill directory %s; kept %zu parked file(s) "
+                             "from a previous run, removed %zu orphan(s)%s\n",
+                             o.conversation_cache_dir.c_str(), adopted ? conversations.spilled_entries() : 0,
+                             removed, clear_error.empty() ? "" : (std::string(" (WARNING: ") + clear_error + ")").c_str());
+            }
             }
         }
         // The segment tier's own directory and hooks (R4 阶段 A): the same file format, identity and RAM floor
@@ -7064,12 +7097,7 @@ int main(int argc, char** argv) {
                                  "the segment tier stays off and restores fall back to the whole-file tier\n",
                                  seg_dir.c_str(), seg_fs_ec.message().c_str());
                 } else {
-                    std::string seg_clear_error;
-                    const size_t seg_cleared = strata::core::conversation_spill_clear_dir(seg_dir, "seg-", seg_clear_error);
-                    std::fprintf(stderr, "strata serve: conversation segment cache: directory %s (budget %lld MiB); "
-                                 "cleared %zu segment file(s) from a previous run%s\n",
-                                 seg_dir.c_str(), (long long) o.conversation_segment_budget_mib, seg_cleared,
-                                 seg_clear_error.empty() ? "" : (std::string(" (WARNING: ") + seg_clear_error + ")").c_str());
+                    // The directory clear runs after the manifest is adopted (below), so the files it names survive.
                     strata::core::ConversationSegmentCache::Hooks seg_hooks;
                     seg_hooks.dir = seg_dir;
                     seg_hooks.write = [&](const strata::core::SavedConversation& image, const std::string& path,
@@ -7111,6 +7139,36 @@ int main(int argc, char** argv) {
                     };
                     conv_segments = strata::core::ConversationSegmentCache(
                         true, (size_t) o.conversation_segment_budget_mib << 20, std::move(seg_hooks));
+                    // The restart-survival patch: adopt the persisted segment manifest before the clear.
+                    {
+                        const std::string seg_manifest_path = seg_dir + "/segment-manifest-v1.bin";
+                        std::vector<std::string> present;
+                        std::error_code pec;
+                        for (std::filesystem::directory_iterator it(seg_dir, pec), end; !pec && it != end; it.increment(pec)) {
+                            if (!it->is_regular_file(pec) || pec) continue;
+                            const std::string name = it->path().filename().string();
+                            if (name.rfind("seg-", 0) == 0 && name.size() > 4 && name.compare(name.size() - 4, 4, ".bin") == 0)
+                                present.push_back(name);
+                        }
+                        std::vector<uint8_t> blob;
+                        std::string merr, aerr;
+                        bool adopted = false;
+                        if (o.conversation_cache_persist && strata::core::conversation_manifest_read(seg_manifest_path, blob, merr)) {
+                            adopted = conv_segments.adopt_manifest(blob, present, aerr);
+                            if (!adopted)
+                                std::fprintf(stderr, "strata serve: conversation segment cache: WARNING: the segment "
+                                             "manifest does not read (%s); clearing the directory as before\n", aerr.c_str());
+                        }
+                        std::string seg_clear_error;
+                        const size_t seg_removed = strata::core::conversation_spill_clear_dir_except(
+                            seg_dir, "seg-",
+                            adopted ? conv_segments.segment_files() : std::vector<std::string>{}, seg_clear_error);
+                        std::fprintf(stderr, "strata serve: conversation segment cache: directory %s (budget %lld MiB); "
+                                     "kept %zu segment(s) from a previous run, removed %zu orphan(s)%s\n",
+                                     seg_dir.c_str(), (long long) o.conversation_segment_budget_mib,
+                                     adopted ? conv_segments.entries() : 0, seg_removed,
+                                     seg_clear_error.empty() ? "" : (std::string(" (WARNING: ") + seg_clear_error + ")").c_str());
+                    }
                 }
             }
         }
@@ -7221,7 +7279,29 @@ int main(int argc, char** argv) {
                                  seg_stats.admitted, seg_stats.deduped, seg_stats.failed,
                                  std::chrono::duration<double, std::milli>(Clock::now() - t_seg).count(),
                                  conv_segments.entries(), conv_segments.dir_bytes());
+                // The restart-survival patch: persist the segment manifest beside its files (a new segment is
+                // the change worth writing; a dedup touch is not).
+                if (seg_stats.admitted && o.conversation_cache_persist) {
+                    std::string seg_dir = o.conversation_segment_dir;
+                    if (seg_dir.empty() && !o.conversation_cache_dir.empty()) seg_dir = o.conversation_cache_dir + "/segments";
+                    if (!seg_dir.empty()) {
+                        std::string werr;
+                        if (!strata::core::conversation_manifest_write(seg_dir + "/segment-manifest-v1.bin",
+                                                                       conv_segments.dump_manifest(), werr))
+                            std::fprintf(stderr, "strata serve: conversation segment cache: WARNING: cannot persist "
+                                         "the segment manifest (%s)\n", werr.c_str());
+                    }
+                }
                 const bool parked = conversations.park(std::move(image));   // the write frees the RAM (fail-open: a drop)
+                // The restart-survival patch: persist the spill manifest on every successful park (the new
+                // record is the change worth writing; drops and restores leave ghosts that adoption filters).
+                if (parked && o.conversation_cache_persist) {
+                    std::string werr;
+                    if (!strata::core::conversation_manifest_write(o.conversation_cache_dir + "/parked-manifest-v1.bin",
+                                                                   conversations.dump_manifest(), werr))
+                        std::fprintf(stderr, "strata serve: conversation cache: WARNING: cannot persist the manifest "
+                                     "(%s)\n", werr.c_str());
+                }
                 if (parked) {
                     std::fprintf(stderr, "strata serve: conversation cache: parked %zu tokens to disk in %.1f ms; "
                                  "entries=%zu bytes=%zu parks=%zu snapshot_bytes=%zu reused_kv_bytes=%zu "

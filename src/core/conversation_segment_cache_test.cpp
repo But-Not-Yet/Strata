@@ -463,6 +463,44 @@ int main() {
         }
     }
 
+    {   // the restart-survival patch: the segment manifest dumps and the next cache adopts it over the same
+        // fake disk - the mounted segment survives the restart (the file and its verification unchanged)
+        FakeDisk disk;
+        ConversationSegmentCache::Hooks h;
+        ConversationSegmentCache first(true, 1 << 20, fake_hooks(h, disk));
+        const std::vector<int32_t> ids(200, 11);
+        check(first.admit(segment_image(ids, 1)), "restart: the segment admits");
+        const std::vector<uint8_t> blob = first.dump_manifest();
+        check(!blob.empty(), "restart: the segment manifest dumps");
+
+        std::vector<std::string> present;   // the files on the fake disk, by name
+        for (const auto& entry : disk.files)
+            present.push_back(entry.first.substr(entry.first.find_last_of('/') + 1));
+
+        ConversationSegmentCache::Hooks h2;
+        ConversationSegmentCache second(true, 1 << 20, fake_hooks(h2, disk));   // a new process, same disk
+        std::string err;
+        check(second.adopt_manifest(blob, present, err) && err.empty(), "restart: the segment manifest adopts");
+        check(second.entries() == 1, "restart: the record survives");
+        const std::vector<int32_t> prompt(250, 11);   // strictly longer than the segment (the fork tail is the caller's)
+        const auto best = second.best(prompt, {}, true);
+        check(best.found && best.tokens == 200, "restart: the segment matches after adoption");
+        SavedConversation out;
+        int64_t mounted = 0;
+        check(second.mount(best.key, best.tokens, prompt, {}, out, &mounted) && mounted == 200,
+              "restart: it mounts (the token verification is unchanged)");
+
+        // present filtering + malformed input (fail-open)
+        ConversationSegmentCache::Hooks h3;
+        ConversationSegmentCache third(true, 1 << 20, fake_hooks(h3, disk));
+        check(third.adopt_manifest(blob, {}, err) && third.entries() == 0,
+              "restart: without the file present, the record is dropped");
+        auto bad = blob;
+        bad[2] ^= 0xff;
+        check(!third.adopt_manifest(bad, present, err) && third.entries() == 0,
+              "restart: a foreign segment manifest is refused");
+    }
+
     std::printf("conversation_segment_cache_test: %d checks ok\n", checks);
     return 0;
 }

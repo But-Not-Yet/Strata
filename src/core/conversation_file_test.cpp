@@ -775,6 +775,42 @@ int main() {
         check(conversation_spill_clear_dir((dir / "absent-spill").string(), "spill-", clear_error) == 0 &&
               clear_error.empty(), "an absent spill directory is not an error");
     }
+    // the restart-survival patch: the clear that keeps named files, and the manifest blob's round trip
+    {
+        const fs::path spill = dir / "spill-keep";
+        fs::create_directories(spill);
+        spit(spill / "spill-1.bin", std::vector<char>(5, 'a'));
+        spit(spill / "spill-2.bin", std::vector<char>(5, 'b'));
+        spit(spill / "spill-3.bin", std::vector<char>(5, 'c'));
+        spit(spill / ".spill-9.feedface.tmp", std::vector<char>(3, 't'));
+        std::string e;
+        const std::vector<std::string> keep{"spill-1.bin", "spill-3.bin"};
+        const size_t removed = conversation_spill_clear_dir_except(spill.string(), "spill-", keep, e);
+        check(removed == 2 && e.empty(), "clear_dir_except: the orphan and the unnamed file go");
+        check(fs::exists(spill / "spill-1.bin") && fs::exists(spill / "spill-3.bin"),
+              "clear_dir_except: the named files survive");
+        check(!fs::exists(spill / "spill-2.bin") && !fs::exists(spill / ".spill-9.feedface.tmp"),
+              "clear_dir_except: the unnamed file and the temporary orphan are gone");
+        check(conversation_spill_clear_dir_except(spill.string(), "spill-", {}, e) == 2 && e.empty(),
+              "clear_dir_except with no keep: the phase-one clear");
+        check(!fs::exists(spill / "spill-1.bin") && !fs::exists(spill / "spill-3.bin"),
+              "clear_dir_except: everything that is ours is gone now");
+    }
+    {
+        const fs::path mp = dir / "parked-manifest-v1.bin";
+        const std::vector<uint8_t> blob{1, 2, 3, 4, 5};
+        std::string e;
+        check(conversation_manifest_write(mp.string(), blob, e) && e.empty(), "manifest: writes");
+        std::vector<uint8_t> back;
+        check(conversation_manifest_read(mp.string(), back, e) && back == blob, "manifest: reads back byte-exact");
+        check(conversation_manifest_write(mp.string(), std::vector<uint8_t>{9}, e), "manifest: rewrites over");
+        check(conversation_manifest_read(mp.string(), back, e) && back == std::vector<uint8_t>{9},
+              "manifest: the rewrite replaced the old blob");
+        check(!conversation_manifest_read((dir / "absent-manifest.bin").string(), back, e) && back.empty(),
+              "manifest: a missing file reads as no-manifest");
+        (void) conversation_spill_clear_dir(dir.string(), "spill-", e);
+        check(fs::exists(mp), "manifest: the phase-one clear never touches the manifest file");
+    }
 
     fs::remove_all(dir);
     std::printf("conversation_file_test: %d checks passed\n", checks);

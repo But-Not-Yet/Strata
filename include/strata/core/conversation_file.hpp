@@ -246,4 +246,17 @@ std::string session_free_space_dir(const std::string& path, bool windows_rules);
 // the count so far, with `error` set (the engine logs and continues).
 size_t conversation_spill_clear_dir(const std::string& dir, const char* prefix, std::string& error);
 
+// The restart-survival patch (conversation cache persistence): clear everything the phase-one clear would,
+// EXCEPT the files whose name is in `keep` (file names, not paths; a non-empty `keep` is the persisted
+// manifest's list).  The .tmp orphans go either way; an empty `keep` is exactly the phase-one clear.
+size_t conversation_spill_clear_dir_except(const std::string& dir, const char* prefix,
+                                           const std::vector<std::string>& keep, std::string& error);
+
+// The conversation caches' manifest persistence: write/read a small blob beside the parked files (written to
+// a temporary and renamed over, like a session file's publish; the temporary name keeps the phase-one clear
+// out of it).  read: false with `error` when the file is missing or unreadable — the caller treats that as
+// "no manifest" and clears the directory as before (fail-open).
+bool conversation_manifest_write(const std::string& path, const std::vector<uint8_t>& blob, std::string& error);
+bool conversation_manifest_read(const std::string& path, std::vector<uint8_t>& blob, std::string& error);
+
 } // namespace strata::core

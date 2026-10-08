@@ -71,6 +71,57 @@ inline uint64_t conversation_spill_key(const std::vector<int32_t>& ids, const st
     return conversation_spill_key_at(dig, (int64_t) ids.size(), imgs.data(), imgs.size());
 }
 
+// --- manifest persistence helpers (the restart-survival patch; shared by both tiers) ------------------
+// A tiny sidecar blob: magic, version, an auxiliary word, a record count, the records, and an FNV-1a
+// checksum over everything before it.  Hand-rolled little-endian; deliberately versioned and checked so a
+// malformed or foreign file is refused before anything is adopted.
+inline std::string conversation_manifest_leaf(const std::string& path) {
+    const size_t cut = path.find_last_of("/\\");
+    return cut == std::string::npos ? path : path.substr(cut + 1);
+}
+inline uint64_t conversation_manifest_checksum(const uint8_t* p, size_t n) {
+    uint64_t h = 0xcbf29ce484222325ull;
+    for (size_t i = 0; i < n; ++i) { h ^= p[i]; h *= 0x100000001b3ull; }
+    return h;
+}
+struct ConversationManifestWriter {
+    std::vector<uint8_t> bytes;
+    void u8(uint8_t v) { bytes.push_back(v); }
+    void u32(uint32_t v) { for (int i = 0; i < 4; ++i) bytes.push_back(uint8_t(v >> (8 * i))); }
+    void u64(uint64_t v) { for (int i = 0; i < 8; ++i) bytes.push_back(uint8_t(v >> (8 * i))); }
+    void i64(int64_t v) { u64((uint64_t) v); }
+    void blob(const void* p, size_t n) {
+        const uint8_t* c = static_cast<const uint8_t*>(p);
+        bytes.insert(bytes.end(), c, c + n);
+    }
+};
+struct ConversationManifestReader {
+    const uint8_t* p = nullptr;
+    size_t n = 0, off = 0;
+    bool ok = true;
+    bool has(size_t k) const { return ok && off + k <= n; }
+    uint8_t u8() { if (!has(1)) { ok = false; return 0; } return p[off++]; }
+    uint32_t u32() {
+        if (!has(4)) { ok = false; return 0; }
+        uint32_t v = 0;
+        for (int i = 0; i < 4; ++i) v |= uint32_t(p[off++]) << (8 * i);
+        return v;
+    }
+    uint64_t u64() {
+        if (!has(8)) { ok = false; return 0; }
+        uint64_t v = 0;
+        for (int i = 0; i < 8; ++i) v |= uint64_t(p[off++]) << (8 * i);
+        return v;
+    }
+    int64_t i64() { return (int64_t) u64(); }
+    const uint8_t* take(size_t k) {
+        if (!has(k)) { ok = false; return nullptr; }
+        const uint8_t* q = p + off;
+        off += k;
+        return q;
+    }
+};
+
 struct ConversationCheckpoint {
     std::vector<int32_t> ids;
     std::vector<ConversationImageKey> imgs;
@@ -538,6 +589,112 @@ public:
     }
     ConversationKvReuse take_reuse() { return std::exchange(reuse_, {}); }
     size_t retained_bytes() const { return reuse_.bytes(); }
+
+    // ---- manifest persistence: survive a restart (the restart-survival patch) ------------------------
+    // Phase one cleared the spill directory at startup and the RAM manifest died with the process; now the
+    // manifest is dumped beside the parked files (the engine writes the blob) and adopted at the next start,
+    // so a returning prompt can restore a conversation the previous run parked.  Fail-open throughout: a
+    // missing, unreadable or malformed dump is "no manifest" (the caller clears the directory as before),
+    // and a record whose file is not in `present` (file names) is dropped at adoption.
+    std::vector<uint8_t> dump_manifest() const {
+        ConversationManifestWriter w;
+        static const char kMagic[8] = {'S', 'T', 'C', 'M', 'A', 'N', 'P', '1'};
+        w.blob(kMagic, 8);
+        w.u32(1);   // version
+        w.u32(0);   // reserved
+        w.u64(spill_seq_);
+        w.u64(spilled_.size());
+        for (const auto& s : spilled_) {
+            w.u64(s.id);
+            w.i64(s.tokens);
+            w.u8(s.cvec ? 1 : 0);
+            for (int k = 0; k < 7; ++k) w.u8(0);   // pad to 8
+            w.u64(s.bytes);
+            for (int64_t g : s.geometry) w.i64(g);
+            w.u64(s.marks.size());
+            for (const auto& [key, n] : s.marks) {
+                w.u64(key);
+                w.i64(n);
+            }
+            const std::string leaf = conversation_manifest_leaf(s.path);
+            w.u64(leaf.size());
+            w.blob(leaf.data(), leaf.size());
+        }
+        w.u64(conversation_manifest_checksum(w.bytes.data(), w.bytes.size()));
+        return std::move(w.bytes);
+    }
+    bool adopt_manifest(const std::vector<uint8_t>& blob, const std::vector<std::string>& present,
+                        std::string& error) {
+        ConversationManifestReader r{blob.data(), blob.size()};
+        const uint8_t* m = r.take(8);
+        if (!m || std::string(reinterpret_cast<const char*>(m), 8) != "STCMANP1") {
+            error = "not a parked manifest";
+            return false;
+        }
+        if (r.u32() != 1) { error = "unsupported parked manifest version"; return false; }
+        (void) r.u32();
+        const uint64_t seq = r.u64();
+        const uint64_t count = r.u64();
+        if (!r.ok || count > 65536) { error = "malformed parked manifest header"; return false; }
+        std::deque<Spilled> records;
+        for (uint64_t i = 0; i < count; ++i) {
+            Spilled s;
+            s.id = r.u64();
+            s.tokens = r.i64();
+            s.cvec = r.u8() != 0;
+            for (int k = 0; k < 7; ++k) (void) r.u8();
+            s.bytes = (size_t) r.u64();
+            for (int64_t& g : s.geometry) g = r.i64();
+            const uint64_t marks = r.u64();
+            if (!r.ok || marks > 4096) { error = "malformed parked record"; return false; }
+            for (uint64_t k = 0; k < marks; ++k) {
+                const uint64_t key = r.u64();
+                const int64_t n = r.i64();
+                s.marks.push_back({key, n});
+            }
+            const uint64_t path_len = r.u64();
+            if (!r.ok || path_len == 0 || path_len > 4096) { error = "malformed parked record"; return false; }
+            const uint8_t* p = r.take((size_t) path_len);
+            if (!p) { error = "malformed parked record"; return false; }
+            const std::string leaf(reinterpret_cast<const char*>(p), (size_t) path_len);
+            if (leaf.find('/') != std::string::npos || leaf.find('\\') != std::string::npos) {
+                error = "malformed parked path";
+                return false;
+            }
+            s.path = hooks_.dir.empty() ? leaf : hooks_.dir + "/" + leaf;
+            records.push_back(std::move(s));
+        }
+        const uint64_t sum = r.u64();
+        if (!r.ok || r.off != blob.size()) { error = "malformed parked manifest tail"; return false; }
+        if (conversation_manifest_checksum(blob.data(), blob.size() - 8) != sum) {
+            error = "parked manifest checksum mismatch";
+            return false;
+        }
+        std::deque<Spilled> kept;
+        for (auto& s : records) {
+            bool here = false;
+            for (const auto& p : present)
+                if (p == conversation_manifest_leaf(s.path)) { here = true; break; }
+            if (here) kept.push_back(std::move(s));
+        }
+        uint64_t max_id = seq;
+        size_t bytes = 0;
+        for (const auto& s : kept) {
+            max_id = std::max(max_id, s.id);
+            bytes += s.bytes;
+        }
+        spilled_ = std::move(kept);
+        spill_seq_ = max_id;   // the next park's id continues past the adopted ones
+        spilled_bytes_ = bytes;
+        return true;
+    }
+    // The parked files' names, for the startup keep-list of the directory clear.
+    std::vector<std::string> spilled_files() const {
+        std::vector<std::string> v;
+        v.reserve(spilled_.size());
+        for (const auto& s : spilled_) v.push_back(conversation_manifest_leaf(s.path));
+        return v;
+    }
 
 private:
     void drop_spilled(size_t index) {

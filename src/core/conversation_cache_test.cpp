@@ -548,6 +548,72 @@ int main() {
         check(!off.park(image({1, 2, 3})), "a disabled cache parks nothing");
         check(off.best(off_prompt, {}, true).tokens == 0, "a disabled cache has no matches");
     }
+    {   // the restart-survival patch: the manifest dumps at park time and the next process adopts it, so a
+        // returning prompt restores a conversation the previous run parked - the parked files never moved
+        auto c = fresh();
+        SavedConversation big = image({1, 2, 3});
+        ConversationCheckpoint cp;
+        cp.ids = {1, 2};
+        big.checkpoints.push_back(cp);
+        big.kv.emplace_back();
+        big.kv.back().k.resize(256, 5);
+        check(c.park(std::move(big)), "restart: the conversation parks");
+        check(c.park(image({7, 8, 9})), "restart: the second conversation parks");
+        const std::vector<uint8_t> blob = c.dump_manifest();
+        check(!blob.empty(), "restart: the manifest dumps");
+
+        std::vector<std::string> present;   // the files actually on disk, by name
+        for (const auto& de : fs::directory_iterator(dir))
+            present.push_back(de.path().filename().string());
+
+        ConversationCache next(true, 1 << 20);   // a new process: same directory, an empty manifest
+        next.set_spill_hooks(hooks);
+        std::string err;
+        check(next.adopt_manifest(blob, present, err) && err.empty(), "restart: the manifest adopts");
+        check(next.spilled_entries() == 2, "restart: both records survive");
+        const std::vector<int64_t> prompt{1, 2, 3, 4};
+        auto m = next.best(prompt, {}, true);
+        check(m.spilled && m.tokens == 3, "restart: the parked conversation matches after adoption");
+        SavedConversation out;
+        check(next.restore_spilled_exact(m.id, m.tokens, prompt, {}, out), "restart: it restores");
+        check(out.live.ids == std::vector<int32_t>({1, 2, 3}), "restart: the restored state is the parked one");
+        check(next.spilled_entries() == 1, "restart: the restored record was consumed (one left)");
+
+        // present filtering: a record whose file is not in the present list is dropped at adoption
+        std::vector<std::string> without_one = present;
+        without_one.pop_back();
+        ConversationCache filtered(true, 1 << 20);
+        filtered.set_spill_hooks(hooks);
+        check(filtered.adopt_manifest(blob, without_one, err) && filtered.spilled_entries() == 1,
+              "restart: a record whose file is absent is dropped at adoption");
+        check(filtered.spilled_bytes() > 0, "restart: the surviving record keeps its accounting");
+
+        // a new park after adoption continues the id sequence (no clash with the adopted files)
+        check(filtered.park(image({4, 4, 4})), "restart: a post-adoption park works");
+        size_t max_id = 0;
+        for (const auto& de : fs::directory_iterator(dir)) {
+            const std::string name = de.path().filename().string();
+            if (name.rfind("spill-", 0) == 0 && name.size() > 10) {
+                const size_t id = (size_t) std::stoull(name.substr(6, name.size() - 10));
+                if (id > max_id) max_id = id;
+            }
+        }
+        check(max_id >= 3, "restart: the id sequence continued past the adopted records");
+
+        // malformed blobs are refused and adopt nothing (fail-open)
+        auto bad = blob;
+        bad[3] ^= 0xff;
+        ConversationCache refused(true, 1 << 20);
+        refused.set_spill_hooks(hooks);
+        check(!refused.adopt_manifest(bad, present, err), "restart: a foreign magic is refused");
+        auto torn = blob;
+        torn.resize(12);
+        check(!refused.adopt_manifest(torn, present, err) && refused.spilled_entries() == 0,
+              "restart: a truncated manifest is refused and adopts nothing");
+        auto flipped = blob;
+        flipped[flipped.size() - 3] ^= 0x01;
+        check(!refused.adopt_manifest(flipped, present, err), "restart: a checksum mismatch is refused");
+    }
     fs::remove_all(dir);
     std::printf("conversation_cache_test: %d checks passed\n", checks);
 }
