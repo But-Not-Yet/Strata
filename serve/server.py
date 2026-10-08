@@ -1668,7 +1668,7 @@ class StrataEngine:
         except OSError:
             pass
         finally:
-            if self.proc.poll() is not None:
+            if self.proc is not None and self.proc.poll() is not None:
                 if self.pump is not None and self.pump.ident is not None:   # a restart can stop before starting it
                     self.pump.join(timeout=2)
                 try:
