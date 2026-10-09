@@ -614,6 +614,87 @@ int main() {
         flipped[flipped.size() - 3] ^= 0x01;
         check(!refused.adopt_manifest(flipped, present, err), "restart: a checksum mismatch is refused");
     }
+    {   // R4-capacity A: the spill tier's directory-byte budget mirrors the segment tier's criterion 11 —
+        // refs==0 evicted, oldest park first, refs>0 never touched
+        auto probe = fresh();
+        check(probe.park(image({1, 2, 3})), "measure: one park sets the unit");
+        const size_t unit = probe.spilled_bytes();   // the budget is on the record-byte accounting, like the segment tier's
+        check(unit > 0, "one parked record's bytes are the budget unit");
+        { fs::remove_all(dir); fs::create_directories(dir); spill_files.clear(); }
+        ConversationCache c(true, 0, 3 * unit);   // a budget holding exactly three records
+        c.set_spill_hooks(hooks);
+        check(c.park(image({10, 11, 12})), "A parked");
+        check(c.park(image({20, 21, 22})), "B parked");
+        check(c.park(image({30, 31, 32})), "C parked");
+        check(c.park(image({40, 41, 42})), "D parked");
+        check(c.park(image({50, 51, 52})), "E parked");
+        // the five parks each reconciled the directory; the budget evicts at park time
+        check(c.spilled_entries() == 3, "the budget evicts until the directory fits (five parks leave three)");
+        check(c.evictions() == 2, "two evictions counted");
+        check(c.dir_bytes() > 0, "the directory's observable bytes stay reported");
+        // oldest-first: the survivors are the three newest records
+        const std::vector<int64_t> probe_prompt{50, 51, 52, 53};
+        check(c.best(probe_prompt, {}, true).spilled, "the newest record survived the eviction");
+        const std::vector<int64_t> oldest_prompt{10, 11, 12, 13};
+        check(c.best(oldest_prompt, {}, true).tokens == 0, "the oldest record was evicted");
+        check(on_disk() == 3, "an eviction deletes the file behind the record");
+        // refs>0 are never evicted: park three, pin the two oldest, then park a fourth under the budget —
+        // evict-then-admit must take the oldest UNPINNED (H), not the pinned pair
+        ConversationCache pinned(true, 0, 3 * unit);
+        pinned.set_spill_hooks(hooks);
+        check(pinned.park(image({60, 61, 62})), "F parked");
+        check(pinned.park(image({70, 71, 72})), "G parked");
+        check(pinned.park(image({80, 81, 82})), "H parked");
+        const auto mf = pinned.best(std::vector<int64_t>{60, 61, 62, 63}, {}, true);
+        const auto mg = pinned.best(std::vector<int64_t>{70, 71, 72, 73}, {}, true);
+        check(mf.spilled && mg.spilled, "the two oldest records are findable before pinning");
+        check(pinned.ref(mf.id) == 1 && pinned.ref(mg.id) == 1, "an active session pins its record (refs in memory)");
+        check(pinned.park(image({90, 91, 92})), "I parks: the budget evicts the oldest unpinned (H)");
+        check(pinned.evictions() == 1 && pinned.spilled_entries() == 3, "one eviction, three records remain");
+        check(pinned.best(std::vector<int64_t>{80, 81, 82, 83}, {}, true).tokens == 0, "the oldest unpinned was the victim");
+        check(pinned.best(std::vector<int64_t>{60, 61, 62, 63}, {}, true).spilled &&
+              pinned.best(std::vector<int64_t>{70, 71, 72, 73}, {}, true).spilled, "the pinned pair survived");
+        SavedConversation back;
+        check(pinned.restore_spilled_exact(mf.id, mf.tokens, std::vector<int64_t>{60, 61, 62, 63}, {}, back) &&
+              back.live.ids == std::vector<int32_t>({60, 61, 62}), "the pinned record restores");
+        pinned.unref(mf.id);
+        pinned.unref(mg.id);
+        check(pinned.spilled_entries() == 2, "the restore consumed mf's record; two unpinned records stand");
+    }
+    {   // R4-capacity B: boot adoption under a budget — planted parked files plus a persisted manifest;
+        // adoption evicts over-budget records (oldest first), the kept count is corrected, and the
+        // manifest re-dump validates so the next boot adopts the post-eviction set
+        auto c = fresh();
+        for (int32_t head : {100, 110, 120, 130})
+            check(c.park(image({head, head + 1, head + 2})), "planted park");
+        const size_t unit = c.spilled_bytes() / 4;   // exact record-accounting bytes: the budget's currency
+        check(unit > 0, "the planted records' bytes set the unit");
+        std::vector<uint8_t> blob = c.dump_manifest();
+        const std::vector<uint8_t> pristine = blob;
+        std::vector<std::string> present;
+        for (const auto& de : fs::directory_iterator(dir)) present.push_back(de.path().filename().string());
+        ConversationCache next(true, 1 << 20, 3 * unit);   // a new process under the tight budget
+        next.set_spill_hooks(hooks);
+        std::string err;
+        check(next.adopt_manifest(blob, present, err) && err.empty(), "restart: the manifest adopts");
+        check(next.spilled_entries() == 3, "adoption reports the corrected kept count under the budget");
+        check(next.evictions() == 1, "adoption evicted the oldest over-budget record");
+        check(on_disk() == 3, "the evicted leaf is gone from disk: adoption's keep-list cannot resurrect it");
+        const std::vector<int64_t> oldest_prompt{100, 101, 102, 103};
+        check(next.best(oldest_prompt, {}, true).tokens == 0, "the evicted record's marks no longer match");
+        const std::vector<int64_t> newest_prompt{130, 131, 132, 133};
+        check(next.best(newest_prompt, {}, true).tokens == 3, "the newest adopted record still matches");
+        // the re-dumped manifest validates: a third process adopts the post-eviction set
+        const std::vector<uint8_t> re = next.dump_manifest();
+        ConversationCache third(true, 1 << 20, 3 * unit);
+        third.set_spill_hooks(hooks);
+        check(third.adopt_manifest(re, present, err) && third.spilled_entries() == 3 &&
+              third.evictions() == 0, "the re-dumped manifest checksum validates and adopts the post-eviction set");
+        ConversationCache tight(true, 1 << 20, 2 * unit);
+        tight.set_spill_hooks(hooks);
+        check(tight.adopt_manifest(pristine, present, err) && tight.spilled_entries() == 2 &&
+              tight.evictions() == 2, "an over-budget adoption evicts oldest-first down to the cap");
+    }
     fs::remove_all(dir);
     std::printf("conversation_cache_test: %d checks passed\n", checks);
 }

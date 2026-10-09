@@ -327,6 +327,9 @@ public:
     // state's token count, the geometry it was captured with, and the file.
     struct Spilled {
         uint64_t id = 0;                                   // unique, never reused; restore addresses records by it
+        uint64_t refs = 0;                    // live sessions holding this snapshot: never evicted while > 0
+                                              // (RAM-only: like the segment tier's, pins do not survive a restart,
+                                              //  so the v1 manifest format carries no refs field)
         std::vector<std::pair<uint64_t, int64_t>> marks;   // (key hash, token count)
         int64_t tokens = 0;                                // the live state's tokens at park time
         std::array<int64_t, 18> geometry{};
@@ -337,8 +340,11 @@ public:
 
     // `reuse_budget`: the optional cap on the transient K/V retained between a restore and the next park (the
     // --conversation-cache-mib flag's one remaining use); 0 retains nothing.
-    explicit ConversationCache(bool enabled, size_t reuse_budget = 0)
-        : enabled_(enabled), reuse_budget_(reuse_budget) {}
+    // `spill_dir_budget`: the spill directory's byte cap (R4-capacity, mirroring the segment tier's criterion-11
+    // eviction); 0 = unbounded (tests and the pre-budget default).  Eviction runs at park time and, when the free
+    // space is short, before a park's admission — evict-then-admit, never skip-park.
+    explicit ConversationCache(bool enabled, size_t reuse_budget = 0, size_t spill_dir_budget = 0)
+        : enabled_(enabled), reuse_budget_(reuse_budget), spill_dir_budget_(spill_dir_budget) {}
     bool enabled() const { return enabled_; }
     size_t bytes() const { return reuse_.bytes(); }
     // the longest parked conversation, in tokens (--kv-grow keeps the K/V that long while it could be restored;
@@ -371,6 +377,37 @@ public:
         for (const auto& s : spilled_) n = std::max(n, s.bytes);
         return n;
     }
+    // --- the spill tier's directory-byte budget (R4-capacity: mirror the segment tier's criterion 11) ---
+    // Candidate = records with refs==0; order = manifest order (spilled_ is oldest-park first, and adoption
+    // preserves the manifest's order, so this is oldest-first); evict until the record-byte accounting
+    // (spilled_bytes_, the same currency the segment tier's dir_bytes_ keeps) is within the budget.
+    // `incoming` is a park's own bytes: evict_for_admission makes room for the file ABOUT to be written,
+    // so a park under a tight directory evicts first and then admits — never skips the park.
+    size_t evictions() const { return evictions_; }
+    size_t ref(uint64_t id) {   // an active session pins its record; RAM-only like the segment tier's pins
+        for (auto& s : spilled_)
+            if (s.id == id) { ++s.refs; return (size_t) s.refs; }
+        return 0;
+    }
+    void unref(uint64_t id) {
+        for (auto& s : spilled_)
+            if (s.id == id && s.refs > 0) { --s.refs; return; }
+    }
+    size_t evict_for_admission(size_t incoming) {
+        if (spill_dir_budget_ == 0) return 0;
+        size_t evicted = 0;
+        while (spilled_bytes_ + incoming > spill_dir_budget_) {
+            size_t victim = spilled_.size();
+            for (size_t i = 0; i < spilled_.size(); ++i)
+                if (spilled_[i].refs == 0) { victim = i; break; }   // oldest first (deque order)
+            if (victim == spilled_.size()) break;   // everything left is pinned: the budget yields
+            drop_spilled(victim);
+            ++evicted;
+            ++evictions_;
+        }
+        return evicted;
+    }
+    size_t evict_to_budget() { return evict_for_admission(0); }
     const std::string& last_error() const { return last_error_; }
 
     // The manifest match: the longest recorded prefix that the prompt's digests reproduce.  Pure arithmetic over
@@ -419,6 +456,10 @@ public:
             if (!c.ids.empty())
                 m.marks.push_back({conversation_spill_key(c.ids, c.imgs), (int64_t) c.ids.size()});
         m.path = hooks_.dir + "/spill-" + std::to_string(m.id) + ".bin";
+        // Evict-then-admit (requirement 5): before the write, the budget makes room for these bytes (oldest
+        // refs==0 first, pinned records never), so a full directory does not skip the park and the free-space
+        // admission below stays the last resort (fail-open on a genuinely full disk).
+        evict_for_admission(m.bytes);
         const double t0 = now();
         std::string error;
         if (!hooks_.write(image, m.path, error)) {
@@ -686,6 +727,10 @@ public:
         spilled_ = std::move(kept);
         spill_seq_ = max_id;   // the next park's id continues past the adopted ones
         spilled_bytes_ = bytes;
+        // R4-capacity: an adopted set over the spill budget is evicted at once — nothing is pinned at boot,
+        // so refs==0 (all) evict oldest-park-first (the manifest's order), each eviction deleting the file
+        // with the record. The caller's keep-list and any future dump then reflect the evicted set.
+        evict_to_budget();
         return true;
     }
     // The parked files' names, for the startup keep-list of the directory clear.
@@ -707,6 +752,7 @@ private:
 
     bool enabled_ = false;
     size_t reuse_budget_ = 0;
+    size_t spill_dir_budget_ = 0;   // R4-capacity: the spill directory's byte cap (0 = unbounded)
     ConversationKvReuse reuse_;
     SpillHooks hooks_;
     bool spill_ready_ = false;
@@ -714,7 +760,7 @@ private:
     std::deque<Spilled> spilled_;           // the RAM manifest: oldest park first
     uint64_t spill_seq_ = 0;
     size_t parks_ = 0, failed_parks_ = 0, spilled_bytes_ = 0, spilled_restores_ = 0, refused_restores_ = 0,
-           superseded_ = 0;
+           superseded_ = 0, evictions_ = 0;
     size_t dir_bytes_ = 0;
     double park_ms_ = 0;
     std::string last_error_;

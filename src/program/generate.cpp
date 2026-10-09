@@ -605,6 +605,11 @@ struct Options {
     std::string conversation_segment_dir;
     /// --conversation-segment-budget-mib: the segment directory's byte cap (refs==0, oldest last_hit first)
     int64_t conversation_segment_budget_mib = 8192;
+    /// --conversation-spill-budget-mib (R4-capacity): the spill directory's byte cap, mirroring the segment
+    /// tier's criterion 11: the whole-file tier evicted refs==0 records oldest-park-first until the directory
+    /// fits, and a park under a tight directory evicts BEFORE its write (evict-then-admit, never skip-park).
+    /// The default is 3x the segment budget (73728 MiB = 72 GiB); the serve config can override.
+    int64_t conversation_spill_budget_mib = 73728;
     /// --serve SAVE: disk space a session file must leave free where it is written (MiB; 0 = no check)
     int64_t session_min_free_mib = 4096;
     /// --serve: also keep a checkpoint every N freshly read prompt tokens (0 = only at the last turn boundary)
@@ -759,6 +764,10 @@ void usage() {
                  "                       cache dir's \"segments\" subfolder; kept across restarts by default)\n"
                  "  --conversation-segment-budget-mib N  --serve: the segment directory's byte cap, evicted\n"
                  "                       refs==0 oldest-hit first (default 8192)\n"
+                 "  --conversation-spill-budget-mib N  --serve (R4-capacity): the spill directory's byte cap\n"
+                 "                       (default 73728 = 3x the segment budget); the whole-file tier evicts\n"
+                 "                       refs==0 records oldest-park-first until the directory fits, and a park\n"
+                 "                       under a tight directory evicts before its write\n"
                  "  --session-min-free-mib N  --serve: disk space a SAVE must leave free (default 4096; 0 = no check)\n"
                  "  --vram-elastic       --serve (#533, opt-in, NVIDIA): the expert cache in segments (--vram-segment-mib,\n"
                  "                       default 512), so the command `VRAM <reserve_mib>` (the server's POST /v1/vram) can\n"
@@ -1801,6 +1810,13 @@ int main(int argc, char** argv) {
             o.conversation_segment_budget_mib = std::atoll(next("--conversation-segment-budget-mib"));
             if (o.conversation_segment_budget_mib < 0) {   // a byte cap: 0 would mean unbounded - refuse, not silent
                 std::fprintf(stderr, "strata: --conversation-segment-budget-mib must be >= 0\n");
+                return 1;
+            }
+        }
+        else if (a == "--conversation-spill-budget-mib") {
+            o.conversation_spill_budget_mib = std::atoll(next("--conversation-spill-budget-mib"));
+            if (o.conversation_spill_budget_mib < 0) {   // same cap rule as the segment tier's
+                std::fprintf(stderr, "strata: --conversation-spill-budget-mib must be >= 0\n");
                 return 1;
             }
         }
@@ -6890,7 +6906,8 @@ int main(int argc, char** argv) {
         // (the snapshots accept a null draft)
         strata::core::ConversationCache conversations(
             o.prompt_cache > 0 && !o.conversation_cache_dir.empty(),
-            o.prompt_cache > 0 ? (size_t) o.conversation_cache_mib * 1024 * 1024 : 0);
+            o.prompt_cache > 0 ? (size_t) o.conversation_cache_mib * 1024 * 1024 : 0,
+            (size_t) o.conversation_spill_budget_mib << 20);   // R4-capacity: the spill directory's byte cap
         // The segment tier (R4 §4.5 阶段 A, opt-in): its own directory beside the spill tier's - the two never
         // read or write each other's files.  Built disabled here; the hooks (identity, RAM floor) are wired where
         // the spill hooks are, once the session and the model identity exist.
@@ -7070,13 +7087,17 @@ int main(int argc, char** argv) {
                         std::fprintf(stderr, "strata serve: conversation cache: WARNING: the parked manifest does not "
                                              "read (%s); clearing the directory as before\n", aerr.c_str());
                 }
+                // R4-capacity: adoption itself evicted any over-budget records (refs==0 at boot, oldest-park-
+                // first, files deleted with the records), so the kept count below is post-eviction; the log
+                // states the cap the segment tier's line states.
                 std::string clear_error;
                 const size_t removed = strata::core::conversation_spill_clear_dir_except(
                     o.conversation_cache_dir, "spill-",
                     adopted ? conversations.spilled_files() : std::vector<std::string>{}, clear_error);
-                std::fprintf(stderr, "strata serve: conversation cache: spill directory %s; kept %zu parked file(s) "
-                             "from a previous run, removed %zu orphan(s)%s\n",
-                             o.conversation_cache_dir.c_str(), adopted ? conversations.spilled_entries() : 0,
+                std::fprintf(stderr, "strata serve: conversation cache: spill directory %s (budget %lld MiB); "
+                                     "kept %zu parked file(s) from a previous run, removed %zu orphan(s)%s\n",
+                             o.conversation_cache_dir.c_str(), (long long) o.conversation_spill_budget_mib,
+                             adopted ? conversations.spilled_entries() : 0,
                              removed, clear_error.empty() ? "" : (std::string(" (WARNING: ") + clear_error + ")").c_str());
             }
             }
@@ -7292,10 +7313,15 @@ int main(int argc, char** argv) {
                                          "the segment manifest (%s)\n", werr.c_str());
                     }
                 }
+                // R4-capacity: count the evictions this park's attempt makes (evict-then-admit runs before
+                // the write, so a full directory frees bytes and then admits — never skips the park).
+                const size_t evicted0 = conversations.evictions();
                 const bool parked = conversations.park(std::move(image));   // the write frees the RAM (fail-open: a drop)
                 // The restart-survival patch: persist the spill manifest on every successful park (the new
                 // record is the change worth writing; drops and restores leave ghosts that adoption filters).
-                if (parked && o.conversation_cache_persist) {
+                // R4-capacity: an eviction — before the write (evict-then-admit) or after a failed one — is a
+                // change to the manifest too, so the dump runs whenever either happened.
+                if ((parked || conversations.evictions() > evicted0) && o.conversation_cache_persist) {
                     std::string werr;
                     if (!strata::core::conversation_manifest_write(o.conversation_cache_dir + "/parked-manifest-v1.bin",
                                                                    conversations.dump_manifest(), werr))
@@ -7325,6 +7351,11 @@ int main(int argc, char** argv) {
                                  "the outgoing conversation is dropped; entries=%zu bytes=%zu\n",
                              conversations.last_error().c_str(), conversations.spilled_entries(),
                              conversations.spilled_bytes());
+                if (conversations.evictions() > evicted0)
+                    std::fprintf(stderr, "strata serve: conversation cache: evicted %zu parked record(s) under the"
+                                 " spill budget (the park write itself %s); evictions=%zu\n",
+                                 conversations.evictions() - evicted0, parked ? "succeeded" : "failed",
+                                 conversations.evictions());
             } catch (const std::bad_alloc&) {
                 // The active state has not been touched. Continue with normal
                 // prompt processing rather than killing a serving process.
