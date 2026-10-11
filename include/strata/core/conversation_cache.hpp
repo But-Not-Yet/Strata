@@ -343,10 +343,18 @@ public:
     // `spill_dir_budget`: the spill directory's byte cap (R4-capacity, mirroring the segment tier's criterion-11
     // eviction); 0 = unbounded (tests and the pre-budget default).  Eviction runs at park time and, when the free
     // space is short, before a park's admission — evict-then-admit, never skip-park.
-    explicit ConversationCache(bool enabled, size_t reuse_budget = 0, size_t spill_dir_budget = 0)
-        : enabled_(enabled), reuse_budget_(reuse_budget), spill_dir_budget_(spill_dir_budget) {}
+    // `min_tokens`: the --conversation-cache-min-tokens floor; 0 parks every conversation, whatever its size.
+    explicit ConversationCache(bool enabled, size_t reuse_budget = 0, size_t spill_dir_budget = 0,
+                               int64_t min_tokens = 0)
+        : enabled_(enabled), reuse_budget_(reuse_budget), spill_dir_budget_(spill_dir_budget),
+          min_tokens_(min_tokens) {}
     bool enabled() const { return enabled_; }
     size_t bytes() const { return reuse_.bytes(); }
+    /// `--conversation-cache-min-tokens`: whether a conversation of this length is worth parking.  A parked
+    /// conversation costs a file in the spill directory whatever its length, so a client that interleaves short
+    /// side requests with one long conversation spends the cache on the side requests and evicts the long one
+    /// (oldest park first) - exactly the reuse it wanted.  0 parks every conversation, whatever its size.
+    bool wants(int64_t tokens) const { return min_tokens_ <= 0 || tokens >= min_tokens_; }
     // the longest parked conversation, in tokens (--kv-grow keeps the K/V that long while it could be restored;
     // the parked states live on disk, their host RAM is gone, the cells are not)
     int64_t longest_tokens() const {
@@ -408,6 +416,15 @@ public:
         return evicted;
     }
     size_t evict_to_budget() { return evict_for_admission(0); }
+    // #879 (upstream, adapted to the disk tier): every parked record goes - after non-finite logits any of
+    // them may carry the poison - and the retained K/V with them.  Each record's file is deleted with it; the
+    // next park's reap reconciles the directory whatever the deletion misses.  Returns how many were parked.
+    size_t clear() {
+        const size_t n = spilled_.size();
+        while (!spilled_.empty()) drop_spilled(0);
+        reuse_ = {};
+        return n;
+    }
     const std::string& last_error() const { return last_error_; }
 
     // The manifest match: the longest recorded prefix that the prompt's digests reproduce.  Pure arithmetic over
@@ -437,6 +454,10 @@ public:
         last_error_.clear();
         if (!enabled_ || !spill_ready_) {
             last_error_ = "the conversation cache is disabled";
+            return false;
+        }
+        if (!wants((int64_t) image.live.ids.size())) {   // --conversation-cache-min-tokens: below the floor,
+            last_error_ = "below the min-tokens floor";  // the park is skipped: nothing written, nothing evicted
             return false;
         }
         if (!image.stage_images.empty()) {   // A-F1: format v1 does not carry a layer split's stage images
@@ -753,6 +774,7 @@ private:
     bool enabled_ = false;
     size_t reuse_budget_ = 0;
     size_t spill_dir_budget_ = 0;   // R4-capacity: the spill directory's byte cap (0 = unbounded)
+    int64_t min_tokens_ = 0;   // --conversation-cache-min-tokens: 0 parks every conversation, whatever its size
     ConversationKvReuse reuse_;
     SpillHooks hooks_;
     bool spill_ready_ = false;

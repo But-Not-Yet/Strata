@@ -103,6 +103,23 @@ int main() {
         check(no_budget.retained_bytes() == 0, "without a retention budget nothing is retained");
     }
     {
+        // --conversation-cache-min-tokens: a conversation shorter than the minimum is not worth a spill file.
+        // Parking is a switch-time decision, so without this a client's short side requests park themselves and,
+        // once the spill directory is full, evict the long conversation they were interleaved with (oldest park first).
+        ConversationCache any(true, 0, 0, 0), floor(true, 0, 0, 12288);
+        check(any.enabled() && floor.enabled(), "the minimum does not disable the cache");
+        check(any.wants(0) && any.wants(1) && any.wants(1 << 20), "0 parks every length, as before the flag");
+        check(!floor.wants(0) && !floor.wants(1) && !floor.wants(12287), "below the minimum is not parked");
+        check(floor.wants(12288) && floor.wants(12289), "the minimum itself and above are parked");
+        // the CLI rejects a negative, but the predicate must not invert for one that reaches it another way
+        ConversationCache negative(true, 0, 0, -1);
+        check(negative.wants(0) && negative.wants(1), "a negative minimum parks everything, like 0");
+        // wants() answers for the length alone; the gate is enabled() && wants(), so a disabled cache parks
+        // nothing whatever the length - keep the two independent rather than folding one into the other
+        ConversationCache disabled_min(false, 0, 0, 12288);
+        check(!disabled_min.enabled() && disabled_min.wants(1 << 20), "a disabled cache still answers for length");
+    }
+    {
         // layer-split parking: checkpoints moved apart into stage parts and put back, no running state copied
         auto running = [](std::initializer_list<int32_t> ids, uint8_t salt, size_t parts) {
             ConversationCheckpoint c;
