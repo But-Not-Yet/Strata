@@ -5,6 +5,44 @@
 <p align="center"><b>Run a 125-billion-parameter AI model on your own gaming PC</b><br>
 NVIDIA or AMD graphics card (12 GB or more) · Windows or Linux · free and open source</p>
 
+<details open align="center"><summary><b>本 fork · This fork</b></summary>
+
+**本分支在上游 0.1.44.1（`296b59d2`）之上加了 15 笔提交，主题是一个：对话缓存以磁盘为准，且跨进程重启存活。**
+
+- **停放（park-on-displacement）**：一条对话的 KV 记录被下一条顶掉时，它的实时状态先写进磁盘
+  （`--conversation-cache-dir`），下一条文件随后才读——内存里没有常驻缓存条目，磁盘就是唯一的缓存层。
+- **跨重启**：引擎重启后按清单对账认领上次留下的停放文件（启动日志报 `kept N parked file(s)`，孤儿清零），
+  回到同一对话时直接恢复到它最深的检查点，前缀不必重算。
+- **按前缀分段**：SSD 层拆成按内容寻址前缀键的段（段预算 `--conversation-segment-budget-mib`），
+  同前缀的多轮只写一次，未被引用的最旧段按 LRU 驱逐；停放目录总预算默认取段预算的 3 倍。
+- **serve**：思考预算耗尽时为中文会话注入中文收尾指令（英文会话行为不变）；`close()` 清理的小健壮性修复。
+
+在 RX 7900 XTX 24 GB（Linux，ROCm，hip 后端）上持续跑生产流量并实测：重启后段文件认领成功，
+恢复的段撑住一条 141,591 token 的真请求复用 98,304（94.5%），新 token 预填充 752.6 tok/s。
+上游的全部提交与作者保持原样，MIT 许可证不变。
+
+**English.** This branch adds 15 commits on top of upstream 0.1.44.1 (`296b59d2`), on one theme:
+a disk-authoritative conversation cache that survives engine restarts.
+
+- **Park-on-displacement**: when a conversation's KV record loses its slot, its live state is written to disk
+  (`--conversation-cache-dir`) *before* the incoming file is read; there is no RAM cache tier — the disk is the cache.
+- **Across restarts**: the engine reconciles a manifest and adopts the previous run's parked files
+  (`kept N parked file(s)` at startup, orphans cleared), so a returning conversation restores at its deepest
+  checkpoint instead of recomputing its prefix.
+- **Prefix segments**: the SSD tier is split into content-addressed prefix segments under a budget
+  (`--conversation-segment-budget-mib`); same-prefix turns write once, and unreferenced segments go
+  oldest-park-first (LRU). The spill directory is capped at 3x the segment budget by default.
+- **serve**: a Chinese reasoning wrap-up instruction is injected for Chinese sessions when the thinking budget
+  is exhausted (English sessions unchanged); a small robustness fix in `close()` cleanup.
+
+Verified in production on an RX 7900 XTX 24 GB (Linux, ROCm, hip backend): restored segments backed a real
+141,591-token request with 98,304 reused (94.5%) at 752.6 tok/s on the new tokens. All upstream commits and
+authors are preserved unchanged; the MIT license stands.
+
+</details>
+
+---
+
 <p align="center"><a href="https://github.com/Niko1221/Strata/releases/download/v0.1.10/Pagoda.mp4"><img src="docs/media/pagoda-preview.webp" width="720" alt="A voxel pagoda garden that Strata's model wrote, running in the browser"></a><br>
 <sub>A voxel pagoda garden, 1 shot prompt running on an RTX 5070 with Strata (IQ3_S, 128K context) ·
 <a href="https://github.com/Niko1221/Strata/releases/download/v0.1.10/Pagoda.mp4">full video (49 s)</a></sub></p>
