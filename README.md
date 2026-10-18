@@ -7,7 +7,7 @@ NVIDIA or AMD graphics card (12 GB or more) · Windows or Linux · free and open
 
 <details open align="center"><summary><b>本 fork · This fork</b></summary>
 
-**本分支在上游 0.1.44.1（`296b59d2`）之上加了 15 笔提交，主题是一个：对话缓存以磁盘为准，且跨进程重启存活。**
+**本分支在上游 0.1.45（`477ac13c`）之上加了 16 笔提交，主题是一个：对话缓存以磁盘为准，且跨进程重启存活。**
 
 - **停放（park-on-displacement）**：一条对话的 KV 记录被下一条顶掉时，它的实时状态先写进磁盘
   （`--conversation-cache-dir`），下一条文件随后才读——内存里没有常驻缓存条目，磁盘就是唯一的缓存层。
@@ -21,7 +21,7 @@ NVIDIA or AMD graphics card (12 GB or more) · Windows or Linux · free and open
 恢复的段撑住一条 141,591 token 的真请求复用 98,304（94.5%），新 token 预填充 752.6 tok/s。
 上游的全部提交与作者保持原样，MIT 许可证不变。
 
-**English.** This branch adds 15 commits on top of upstream 0.1.44.1 (`296b59d2`), on one theme:
+**English.** This branch adds 16 commits on top of upstream 0.1.45 (`477ac13c`), on one theme:
 a disk-authoritative conversation cache that survives engine restarts.
 
 - **Park-on-displacement**: when a conversation's KV record loses its slot, its live state is written to disk
