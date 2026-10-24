@@ -13100,6 +13100,7 @@ int main(int argc, char** argv) {
                         }
                 }
             if (lent_slot >= 0 || moved_in >= 0) live_ckpt_resume = false;   // a batch slot's K/V is not the main session
+            if (!stages.empty()) live_ckpt_resume = false;                   // a layer split keeps the park/restore path
             // #2228: a checkpoint or the live state whose TOKENS this prompt starts with, deeper than what is reused, but
             // whose pictures differ (a picture is its grid and the hash of its embeddings: an image encoded again with
             // other bits - another encoder start, a CPU encoder that is not bit-reproducible - no longer matches).  The
