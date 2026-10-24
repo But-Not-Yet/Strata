@@ -86,6 +86,8 @@ struct ConversationView {
 };
 bool conversation_snapshot_bytes(const ConversationView& view, const SessionState& session,
                                  const ModelGeometry& g, const QsaState& draft, size_t& bytes, std::string& error);
+bool conversation_snapshot_meta_bytes(const ConversationView& view, const SessionState& session,
+                                      const ModelGeometry& g, const QsaState& draft, size_t& bytes, std::string& error);
 bool conversation_snapshot_capture_bytes(const ConversationKvReuse& reuse, const ConversationView& view,
                                          const SessionState& session, const ModelGeometry& g,
                                          const QsaState& draft, size_t& bytes, std::string& error);
@@ -101,6 +103,9 @@ bool conversation_snapshot_save(SavedConversation& image, const ConversationView
 // Disk save without capturing the K/V on the host: `meta` gets everything but the K/V (running state copied,
 // checkpoints as given by the view), `sources` one streamed source per QSA layer then the draft.  Caller has
 // synchronized and must not run the session until the file is written.
+bool conversation_snapshot_sources(SavedConversation& meta, std::vector<SessionKvSource>& sources,
+                                   const ConversationView& view, const SessionState& session,
+                                   const ModelGeometry& g, const QsaState* draft, std::string& error);
 bool conversation_snapshot_sources(SavedConversation& meta, std::vector<SessionKvSource>& sources,
                                    const ConversationView& view, const SessionState& session,
                                    const ModelGeometry& g, const QsaState& draft, std::string& error);
@@ -125,6 +130,10 @@ ConversationRestore conversation_snapshot_restore_prefix(const SavedConversation
 // rejected as invalid).
 bool conversation_snapshot_bytes(const ConversationView& view, const SessionState& session, const ModelGeometry& g,
                                  const QsaState* draft, size_t& bytes, std::string& error);
+// The meta portion only (running state, checkpoints, metadata), without any K/V layer: what the streaming disk
+// save allocates on the host.  The full estimate minus every layer's conversation_kv_bytes.
+bool conversation_snapshot_meta_bytes(const ConversationView& view, const SessionState& session,
+                                      const ModelGeometry& g, const QsaState* draft, size_t& bytes, std::string& error);
 bool conversation_snapshot_capture_bytes(const ConversationKvReuse& reuse, const ConversationView& view,
                                          const SessionState& session, const ModelGeometry& g, const QsaState* draft,
                                          size_t& bytes, std::string& error);

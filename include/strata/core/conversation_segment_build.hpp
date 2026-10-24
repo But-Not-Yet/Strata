@@ -22,6 +22,7 @@
 #include "strata/kernels/qsa.hpp"
 
 #include <cstdint>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -188,6 +189,72 @@ inline SegmentParkStats conversation_segment_park(ConversationSegmentCache& cach
         } else {
             ++stats.failed;   // a write failure is fail-open (the strategy layer left no record, no half file)
         }
+    }
+    return stats;
+}
+
+/// The streaming form of `conversation_segment_park`: the segment image is never materialized.  Its meta is the
+/// checkpoint's own running state (about 118 MB at this geometry) and its K/V is the prefix of each live source,
+/// written through the same aligned block.  Key/dedup/budget rules are unchanged.
+inline SegmentParkStats conversation_segment_park_streamed(ConversationSegmentCache& cache,
+                                                           const SavedConversation& meta,
+                                                           const std::vector<SessionKvSource>& sources,
+                                                           int64_t min_seg = 4096) {
+    SegmentParkStats stats;
+    if (!cache.enabled() || !meta.stage_images.empty() || meta.live.ids.empty()) return stats;
+    std::vector<int64_t> lens;
+    lens.reserve(meta.checkpoints.size());
+    for (const auto& c : meta.checkpoints)
+        if (!c.ids.empty()) lens.push_back((int64_t) c.ids.size());
+    const auto shapes = strata::kernels::qsa_real_shapes();
+    for (int64_t n : conversation_segment_bounds(lens, (int64_t) meta.live.ids.size(), min_seg)) {
+        const ConversationCheckpoint* ck = nullptr;
+        for (const auto& c : meta.checkpoints)
+            if ((int64_t) c.ids.size() == n) { ck = &c; break; }
+        if (ck == nullptr) continue;
+        if (cache.holds(conversation_spill_key(ck->ids, ck->imgs))) {
+            ++stats.deduped;   // no meta copy, no source read, no write
+            continue;
+        }
+        const int64_t cells = ((n + shapes.page_size - 1) / shapes.page_size) * shapes.page_size;
+        const int64_t pooled_rows = n / shapes.idx_block + 1;
+        SavedConversation seg_meta;
+        seg_meta.geometry = meta.geometry;
+        seg_meta.layer_lo = meta.layer_lo;
+        seg_meta.layer_hi = meta.layer_hi;
+        seg_meta.cvec = meta.cvec;
+        seg_meta.live = *ck;
+        seg_meta.live.used = 0;
+        seg_meta.live.pinned = false;
+        seg_meta.live.imgs.clear();
+        for (const auto& k : meta.live.imgs)
+            if (k.start < n) seg_meta.live.imgs.push_back(k);
+        seg_meta.checkpoints.clear();
+        seg_meta.kv.clear();
+        seg_meta.stage_images.clear();
+        std::vector<SessionKvSource> seg_sources = sources;
+        bool ok = true;
+        for (auto& s : seg_sources) {
+            if (s.cells <= 0) { ok = false; break; }
+            const auto cut = [](size_t full, int64_t full_units, int64_t cut_units) -> size_t {
+                if (full == 0 || full_units <= 0) return 0;
+                if (full % (size_t) full_units != 0) return std::numeric_limits<size_t>::max();
+                return (full / (size_t) full_units) * (size_t) cut_units;
+            };
+            s.sizes[0] = cut(s.sizes[0], s.cells, cells);
+            s.sizes[1] = cut(s.sizes[1], s.cells, cells);
+            s.sizes[2] = cut(s.sizes[2], s.cells, cells);
+            s.sizes[3] = cut(s.sizes[3], s.cells, cells);
+            s.sizes[4] = s.pooled_rows > 0 ? cut(s.sizes[4], s.pooled_rows, pooled_rows) : 0;
+            for (size_t part = 0; part < 5; ++part)
+                if (s.sizes[part] == std::numeric_limits<size_t>::max()) ok = false;
+            if (!ok) break;
+            s.cells = cells;
+            s.pooled_rows = s.pooled_rows > 0 ? pooled_rows : 0;
+        }
+        if (!ok) { ++stats.failed; continue; }
+        if (cache.admit_streamed(std::move(seg_meta), std::move(seg_sources))) ++stats.admitted;
+        else ++stats.failed;   // a write failure is fail-open (the strategy layer left no record, no half file)
     }
     return stats;
 }

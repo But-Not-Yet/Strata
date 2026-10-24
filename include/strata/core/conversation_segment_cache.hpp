@@ -60,6 +60,10 @@ public:
     struct Hooks {
         std::string dir;
         std::function<bool(const SavedConversation&, const std::string& path, std::string& error)> write;
+        // Streaming write: the meta carries the segment's running state, `sources` the K/V prefix, both written
+        // through the aligned block.  No full segment image is materialized.
+        std::function<bool(const SavedConversation&, const std::vector<SessionKvSource>&, const std::string& path,
+                           size_t& written, std::string& error)> write_streamed;
         std::function<bool(const std::string& path, SavedConversation& out, std::string& error)> read;
         std::function<bool(const std::string& path)> remove;
         std::function<uint64_t()> clock;
@@ -172,6 +176,52 @@ public:
             if (hooks_.remove) hooks_.remove(s.path);   // never a half-written file at the record's path
             return false;
         }
+        dir_bytes_ += s.bytes;
+        segments_.push_back(std::move(s));
+        ++admits_;
+        evict_to_budget();
+        return true;
+    }
+
+    // Admit one stable segment from a meta plus streamed K/V prefixes: the same key/dedup/budget rules as
+    // `admit`, but the K/V never lands in a host image.  The file's actual byte count is the record's accounting.
+    bool admit_streamed(SavedConversation&& meta, std::vector<SessionKvSource>&& sources) {
+        last_error_.clear();
+        if (!enabled_) {
+            last_error_ = "the segment cache is disabled";
+            return false;
+        }
+        if (!meta.stage_images.empty()) {
+            last_error_ = "a layer split's stage images do not segment";
+            ++failed_admits_;
+            return false;
+        }
+        if (meta.live.ids.empty()) {
+            last_error_ = "a segment with no tokens has no key";
+            ++failed_admits_;
+            return false;
+        }
+        Segment s;
+        s.key = conversation_spill_key(meta.live.ids, meta.live.imgs);
+        s.tokens = (int64_t) meta.live.ids.size();
+        s.cvec = meta.cvec;
+        s.path = hooks_.dir + "/seg-" + hex(s.key) + ".bin";
+        for (auto& old : segments_) {
+            if (old.key != s.key) continue;
+            old.last_hit = tick();   // dedup: touch, never rewrite
+            ++dedup_hits_;
+            return false;
+        }
+        s.last_hit = tick();
+        std::string error;
+        size_t written = 0;
+        if (!hooks_.write_streamed || !hooks_.write_streamed(meta, sources, s.path, written, error)) {
+            ++failed_admits_;
+            last_error_ = error.empty() ? "the segment write failed" : error;
+            if (hooks_.remove) hooks_.remove(s.path);   // never a half-written file at the record's path
+            return false;
+        }
+        s.bytes = written;
         dir_bytes_ += s.bytes;
         segments_.push_back(std::move(s));
         ++admits_;

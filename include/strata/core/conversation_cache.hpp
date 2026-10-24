@@ -3,6 +3,7 @@
 #pragma once
 
 #include "strata/core/conversation_buffer.hpp"
+#include "strata/core/session_kv_source.hpp"
 
 #include <algorithm>
 #include <array>
@@ -325,6 +326,10 @@ public:
     struct SpillHooks {
         std::string dir;
         std::function<bool(const SavedConversation&, const std::string& path, std::string& error)> write;
+        // Streaming write: the meta carries everything but the K/V; `sources` supplies the layers in order and
+        // the file is written through the same aligned block.  No full host K/V copy exists.
+        std::function<bool(const SavedConversation&, const std::vector<SessionKvSource>&, const std::string& path,
+                           size_t& written, std::string& error)> write_streamed;
         std::function<bool(const std::string& path, SavedConversation& out, std::string& error, bool& admission_refused)> read;
         std::function<bool(const std::string& path)> remove;
         // Reconcile the spill directory against the manifest: remove every spill file not named in `keep`,
@@ -374,7 +379,7 @@ public:
     }
     void set_spill_hooks(SpillHooks hooks) {
         hooks_ = std::move(hooks);
-        spill_ready_ = !hooks_.dir.empty() && (bool) hooks_.write && (bool) hooks_.read;
+        spill_ready_ = !hooks_.dir.empty() && ((bool) hooks_.write || (bool) hooks_.write_streamed) && (bool) hooks_.read;
     }
     bool spill_ready() const { return spill_ready_; }
 
@@ -505,6 +510,64 @@ public:
         spilled_.push_back(std::move(m));
         // Reconcile the directory against the manifest: a file a restore or a supersede ever left behind
         // cannot accumulate (the acceptance bound is on the directory, not on the manifest).
+        if (hooks_.reap) {
+            std::vector<std::string> keep;
+            keep.reserve(spilled_.size());
+            for (const auto& s : spilled_) keep.push_back(s.path);
+            size_t bytes = 0;
+            hooks_.reap(keep, bytes);
+            dir_bytes_ = bytes;
+        }
+        return true;
+    }
+
+    // Park the same displaced conversation without a host K/V image: `meta` carries the running state and the
+    // checkpoints, `sources` supplies every K/V layer straight from where it lives.  The file is written through
+    // the aligned block (O_DIRECT where the filesystem takes it), so the host peak is the meta plus one block,
+    // not the whole snapshot.  Fail-open exactly like `park`; the manifest record and the budget use the file's
+    // actual byte count.
+    bool park_streamed(SavedConversation&& meta, std::vector<SessionKvSource>&& sources, size_t image_bytes) {
+        last_error_.clear();
+        if (!enabled_ || !spill_ready_) {
+            last_error_ = "the conversation cache is disabled";
+            return false;
+        }
+        if (!wants((int64_t) meta.live.ids.size())) {
+            last_error_ = "below the min-tokens floor";
+            return false;
+        }
+        if (!meta.stage_images.empty()) {
+            last_error_ = "a layer split's stage images do not park";
+            ++failed_parks_;
+            return false;
+        }
+        Spilled m;
+        m.id = ++spill_seq_;
+        m.tokens = (int64_t) meta.live.ids.size();
+        m.geometry = meta.geometry;
+        m.cvec = meta.cvec;
+        m.bytes = image_bytes;
+        if (!meta.live.ids.empty())
+            m.marks.push_back({conversation_spill_key(meta.live.ids, meta.live.imgs), m.tokens});
+        for (const auto& c : meta.checkpoints)
+            if (!c.ids.empty())
+                m.marks.push_back({conversation_spill_key(c.ids, c.imgs), (int64_t) c.ids.size()});
+        m.path = hooks_.dir + "/spill-" + std::to_string(m.id) + ".bin";
+        evict_for_admission(m.bytes);
+        const double t0 = now();
+        std::string error;
+        size_t written = 0;
+        if (!hooks_.write_streamed || !hooks_.write_streamed(meta, sources, m.path, written, error)) {
+            ++failed_parks_;
+            last_error_ = error.empty() ? "the park write failed" : error;
+            if (hooks_.remove) hooks_.remove(m.path);
+            return false;
+        }
+        park_ms_ += (now() - t0) * 1000.0;
+        ++parks_;
+        if (written) m.bytes = written;
+        spilled_bytes_ += m.bytes;
+        spilled_.push_back(std::move(m));
         if (hooks_.reap) {
             std::vector<std::string> keep;
             keep.reserve(spilled_.size());

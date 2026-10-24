@@ -9540,6 +9540,7 @@ int main(int argc, char** argv) {
         // here (format v1: the identity binds it to this engine, the read validates it before any use) instead of
         // being held in RAM.  Phase one: a restart clears the directory - the cache does not survive a restart yet.
         constexpr uint64_t kParkWriteMarginBytes = 64ull << 20;   // the write's working margin, one figure everywhere
+        constexpr uint64_t kParkStagingBytes = 16ull << 20;       // the file writer's aligned block (conversation_file.cpp)
         if (!o.conversation_cache_dir.empty()) {
             std::error_code fs_ec;
             std::filesystem::create_directories(o.conversation_cache_dir, fs_ec);
@@ -9558,6 +9559,17 @@ int main(int argc, char** argv) {
                 wo.min_free_bytes = image.bytes() + kParkWriteMarginBytes;   // the file itself plus the margin
                 size_t bytes = 0;
                 return strata::core::session_file_write(path, image, id, bytes, e, wo, nullptr);
+            };
+            hooks.write_streamed = [&](const strata::core::SavedConversation& meta,
+                                       const std::vector<strata::core::SessionKvSource>& sources,
+                                       const std::string& path, size_t& written, std::string& e) {
+                strata::core::SessionFileIdentity id;
+                if (!session_identity(id, e, {})) return false;
+                strata::core::SessionWriteOptions wo;
+                size_t full = meta.bytes();
+                for (const auto& s : sources) for (size_t n : s.sizes) full += n;
+                wo.min_free_bytes = full + kParkWriteMarginBytes;
+                return strata::core::session_file_write(path, meta, sources, id, written, e, wo, nullptr);
             };
             hooks.read = [&](const std::string& path, strata::core::SavedConversation& out, std::string& e,
                              bool& admission_refused) {
@@ -9680,6 +9692,17 @@ int main(int argc, char** argv) {
                         wo.min_free_bytes = image.bytes() + kParkWriteMarginBytes;
                         size_t bytes = 0;
                         return strata::core::session_file_write(path, image, id, bytes, e, wo, nullptr);
+                    };
+                    seg_hooks.write_streamed = [&](const strata::core::SavedConversation& meta,
+                                                   const std::vector<strata::core::SessionKvSource>& sources,
+                                                   const std::string& path, size_t& written, std::string& e) {
+                        strata::core::SessionFileIdentity id;
+                        if (!session_identity(id, e, {})) return false;
+                        strata::core::SessionWriteOptions wo;
+                        size_t full = meta.bytes();
+                        for (const auto& s : sources) for (size_t n : s.sizes) full += n;
+                        wo.min_free_bytes = full + kParkWriteMarginBytes;
+                        return strata::core::session_file_write(path, meta, sources, id, written, e, wo, nullptr);
                     };
                     seg_hooks.read = [&](const std::string& path, strata::core::SavedConversation& out,
                                          std::string& e) {
@@ -9842,6 +9865,109 @@ int main(int argc, char** argv) {
             (void) estimate;
             const auto t0 = Clock::now();
             try {
+                if (n_st == 0) {
+                    // Single GPU: park without a host K/V image.  The meta carries the running state and the
+                    // checkpoints; every K/V layer is read from the live state by the file writer's aligned block.
+                    // The admission therefore covers the meta plus one segment meta plus the block, not the
+                    // whole snapshot.  A refusal skips the park (the next turn cold-reads) instead of stalling
+                    // the engine in a multi-GB allocation.
+                    size_t meta_estimate = 0;
+                    if (!strata::core::conversation_snapshot_meta_bytes(view, ss, g, draft0, meta_estimate, err)) {
+                        std::fprintf(stderr, "strata serve: conversation cache: skip parking (%s)\n", err.c_str());
+                        err.clear();
+                        return true;
+                    }
+                    size_t max_checkpoint = 0;
+                    for (const auto& c : view.checkpoints) max_checkpoint = std::max(max_checkpoint, c.bytes());
+                    const uint64_t floor = (uint64_t) o.conversation_cache_min_free_mib * 1024 * 1024;
+                    const size_t allocation = meta_estimate + kParkStagingBytes +
+                                              (conv_segments.enabled() ? max_checkpoint : 0) + (64ull << 20);
+                    {
+                        const auto mem = strata::core::sample_host_memory();
+                        if (!strata::core::conversation_memory_admit(
+                                mem ? std::optional<uint64_t>(mem->available) : std::nullopt, allocation, floor)) {
+                            std::fprintf(stderr, "strata serve: conversation cache: skip parking (physical RAM admission; "
+                                         "need %zu MiB plus %lld MiB floor, %s; %zu parked)\n",
+                                         allocation >> 20, (long long) o.conversation_cache_min_free_mib,
+                                         ram_note(mem).c_str(), conversations.spilled_entries());
+                            return true;
+                        }
+                    }
+                    // The retained K/V is not needed by a streamed park; free it before the meta capture.
+                    reuse = {};
+                    stage_reuse.clear();
+                    strata::core::SavedConversation meta;
+                    std::vector<strata::core::SessionKvSource> sources;
+                    if (!strata::core::conversation_snapshot_sources(meta, sources, view, ss, g, draft0, err)) {
+                        std::fprintf(stderr, "strata serve: conversation cache: skip parking (streamed sources: %s)\n",
+                                     err.c_str());
+                        err.clear();
+                        return true;
+                    }
+                    size_t image_bytes = meta.bytes();
+                    for (const auto& s : sources) for (size_t n : s.sizes) image_bytes += n;
+                    strata::core::SegmentParkStats seg_stats;
+                    const auto t_seg = Clock::now();
+                    if (conv_segments.enabled())
+                        seg_stats = strata::core::conversation_segment_park_streamed(conv_segments, meta, sources);
+                    if (seg_stats.admitted || seg_stats.deduped || seg_stats.failed)
+                        std::fprintf(stderr, "strata serve: conversation segment cache: parked %zu segment(s) "
+                                     "(%zu already on disk, %zu failed) in %.1f ms; entries=%zu dir_bytes=%zu\n",
+                                     seg_stats.admitted, seg_stats.deduped, seg_stats.failed,
+                                     std::chrono::duration<double, std::milli>(Clock::now() - t_seg).count(),
+                                     conv_segments.entries(), conv_segments.dir_bytes());
+                    if (seg_stats.admitted && o.conversation_cache_persist) {
+                        std::string seg_dir = o.conversation_segment_dir;
+                        if (seg_dir.empty() && !o.conversation_cache_dir.empty())
+                            seg_dir = o.conversation_cache_dir + "/segments";
+                        if (!seg_dir.empty()) {
+                            std::string werr;
+                            if (!strata::core::conversation_manifest_write(seg_dir + "/segment-manifest-v1.bin",
+                                                                           conv_segments.dump_manifest(), werr))
+                                std::fprintf(stderr, "strata serve: conversation segment cache: WARNING: cannot persist "
+                                             "the segment manifest (%s)\n", werr.c_str());
+                        }
+                    }
+                    const size_t evicted0 = conversations.evictions();
+                    const bool parked = conversations.park_streamed(std::move(meta), std::move(sources), image_bytes);
+                    if ((parked || conversations.evictions() > evicted0) && o.conversation_cache_persist) {
+                        std::string werr;
+                        if (!strata::core::conversation_manifest_write(o.conversation_cache_dir + "/parked-manifest-v1.bin",
+                                                                       conversations.dump_manifest(), werr))
+                            std::fprintf(stderr, "strata serve: conversation cache: WARNING: cannot persist the manifest "
+                                         "(%s)\n", werr.c_str());
+                    }
+                    if (parked) {
+                        std::fprintf(stderr, "strata serve: conversation cache: parked %zu tokens to disk in %.1f ms; "
+                                     "entries=%zu bytes=%zu parks=%zu snapshot_bytes=%zu reused_kv_bytes=0 "
+                                     "dir_bytes=%zu\n",
+                                     live.size(),
+                                     std::chrono::duration<double, std::milli>(Clock::now() - t0).count(),
+                                     conversations.spilled_entries(), conversations.spilled_bytes(),
+                                     conversations.parks(), image_bytes,
+                                     conversations.dir_bytes());
+                        const size_t entries = conversations.spilled_entries();
+                        const double budget = 1.15 * (double) entries * (double) conversations.max_snapshot_bytes();
+                        if ((double) conversations.dir_bytes() > budget)
+                            std::fprintf(stderr, "strata serve: conversation cache: WARNING: the spill directory holds "
+                                         "%zu bytes over %zu entries, above their budget (%.0f x the largest snapshot, %zu bytes)\n",
+                                         conversations.dir_bytes(), entries,
+                                         conversations.max_snapshot_bytes() ? (double) conversations.dir_bytes() /
+                                                                              (double) conversations.max_snapshot_bytes() : 0.0,
+                                         conversations.max_snapshot_bytes());
+                    } else {
+                        std::fprintf(stderr, "strata serve: conversation cache: WARNING: the park write failed (%s); "
+                                     "the outgoing conversation is dropped; entries=%zu bytes=%zu\n",
+                                     conversations.last_error().c_str(), conversations.spilled_entries(),
+                                     conversations.spilled_bytes());
+                    }
+                    if (conversations.evictions() > evicted0)
+                        std::fprintf(stderr, "strata serve: conversation cache: evicted %zu parked record(s) under the"
+                                     " spill budget (the park write itself %s); evictions=%zu\n",
+                                     conversations.evictions() - evicted0, parked ? "succeeded" : "failed",
+                                     conversations.evictions());
+                    return true;
+                }
                 // The RAM guard's one admission check for the capture (upstream's --memory-limit-mib guard,
                 // absorbed without its eviction loop): the disk park holds no RAM afterwards, but the capture
                 // itself allocates the snapshot in host RAM, and under a cgroup / --memory-limit-mib limit that
