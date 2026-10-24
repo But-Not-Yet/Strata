@@ -19,7 +19,7 @@
 
 <details open align="center"><summary><b>本 fork · This fork</b></summary>
 
-**本分支在上游 0.1.48（`v0.2.3`，`5c8dd322`）之上加了 17 笔非合并提交，主题是一个：对话缓存以磁盘为准，且跨进程重启存活。**
+**本分支在上游 0.1.48（`v0.2.3`，`5c8dd322`）之上保留了 15 笔代码与文档补丁（另有 3 笔 README 提交），主题是一个：对话缓存以磁盘为准，且跨进程重启存活。**
 
 - **停放（park-on-displacement）**：一条对话的 KV 记录被下一条顶掉时，它的实时状态先写进磁盘
   （`--conversation-cache-dir`），下一条文件随后才读——内存里没有常驻缓存条目，磁盘就是唯一的缓存层。
@@ -33,8 +33,8 @@
 恢复的段撑住一条 141,591 token 的真请求复用 133,802（94.5%），新 token 预填充 752.6 tok/s。
 上游的全部提交与作者保持原样，MIT 许可证不变。
 
-**English.** This branch adds 17 non-merge commits on top of upstream 0.1.48 (`v0.2.3`, `5c8dd322`), on one theme:
-a disk-authoritative conversation cache that survives engine restarts.
+**English.** This branch keeps 15 code and documentation patches on top of upstream 0.1.48 (`v0.2.3`, `5c8dd322`)
+(plus 3 README commits), on one theme: a disk-authoritative conversation cache that survives engine restarts.
 
 - **Park-on-displacement**: when a conversation's KV record loses its slot, its live state is written to disk
   (`--conversation-cache-dir`) *before* the incoming file is read; there is no RAM cache tier — the disk is the cache.
