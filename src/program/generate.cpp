@@ -13033,12 +13033,17 @@ int main(int argc, char** argv) {
             }
             int64_t resume = 0;
             bool from_live = false;
+            // A checkpoint of the CURRENT live session is not an outgoing conversation: the session already holds
+            // its K/V, so the request can rewind to it and read only the tail.  `live_ckpt_resume` keeps that
+            // distinct from a parked/slot checkpoint (which still needs the park).
+            bool live_ckpt_resume = false;
             if (o.prompt_cache > 0 && want_cvec == cvec_cached) {
                 if (live_ok && starts_with(live, live_imgs)) { resume = (int64_t) live.size(); from_live = true; }
                 for (const ConvCheckpoint& c : checks)
                     if ((int64_t) c.ids.size() > resume && starts_with(c.ids, c.imgs)) {
                         resume = (int64_t) c.ids.size();
                         from_live = false;
+                        live_ckpt_resume = true;
                     }
             }
             // STRATA_SLOT_CKPT_MOVE: a turn checkpoint a batch admission moved into its slot is still one of the main
@@ -13056,6 +13061,7 @@ int main(int argc, char** argv) {
                             std::equal(c.ids.begin(), c.ids.end(), live.begin()) && imgs_below(live_imgs, L) == c.imgs) {
                             resume = L;
                             from_live = false;
+                            live_ckpt_resume = false;   // a batch slot's checkpoint is not the main live session
                             lent_slot = b;
                         }
                     }
@@ -13093,6 +13099,7 @@ int main(int argc, char** argv) {
                             slot_ck = &c;
                         }
                 }
+            if (lent_slot >= 0 || moved_in >= 0) live_ckpt_resume = false;   // a batch slot's K/V is not the main session
             // #2228: a checkpoint or the live state whose TOKENS this prompt starts with, deeper than what is reused, but
             // whose pictures differ (a picture is its grid and the hash of its embeddings: an image encoded again with
             // other bits - another encoder start, a CPU encoder that is not bit-reproducible - no longer matches).  The
@@ -13151,7 +13158,10 @@ int main(int argc, char** argv) {
                     if ((int64_t) c.ids.size() == resume && c.pinned) pin_sibling = true;
             // Park on displacement, the ordering nail: the outgoing conversation is written to its session file and
             // its RAM freed BEFORE the incoming one is read - two live K/V states must never be held at once.
-            if ((!from_live || will_restore || slot_source >= 0) && !pin_sibling && !park_current()) {
+            // The exception is a live checkpoint continuation: the session is rewound in place to a checkpoint it
+            // already holds, the re-rendered tail is discarded, and no second live state exists.  Skip the park.
+            const bool need_park = (!from_live && !live_ckpt_resume) || will_restore || slot_source >= 0;
+            if (need_park && !pin_sibling && !park_current()) {
                 std::printf("ERR %s\n", err.c_str());
                 return 1;
             }
